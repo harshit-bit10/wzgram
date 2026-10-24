@@ -172,7 +172,22 @@ class RecoverGaps:
                     )
                     break
                 elif isinstance(diff, raw.types.updates.ChannelDifferenceTooLong):
-                    local_pts = diff.dialog.pts
+                    pts_from_dialog = getattr(diff.dialog, "pts", None)
+
+                    if pts_from_dialog is None:
+                        # Dialog.pts is flags.0?int in the TL schema — it is absent for
+                        # certain channel types (e.g. broadcast channels without a pts
+                        # counter).  Without a pts anchor we cannot resume, so drop the
+                        # stored state and stop trying to recover this peer.
+                        log.warning(
+                            "ChannelDifferenceTooLong for %s returned a dialog with no "
+                            "pts field; dropping stored state to avoid a stuck loop.",
+                            id
+                        )
+                        unusable = True
+                        break
+
+                    local_pts = pts_from_dialog
                     await self._save_update_state(
                         (
                             id,
