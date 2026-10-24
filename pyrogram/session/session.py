@@ -41,7 +41,7 @@ from pyrogram.errors import (
 )
 from pyrogram.raw.all import layer
 from pyrogram.raw.core import TLObject, Message, MsgContainer, Int, FutureSalts
-from .internals import MsgId, MsgFactory
+from .internals import MsgFactory
 
 log = logging.getLogger(__name__)
 
@@ -474,9 +474,14 @@ class Session:
 
             rejected = is_bad_notification and msg.body.error_code in (16, 17)
 
+            # Use the per-session generator so that a skewed server clock on
+            # one DC does not shift the time offset for all other sessions
+            # running in the same process.
+            _msg_id_gen = self.msg_factory.msg_id_gen
+
             async with self._handler_lock:
                 if rejected or not self.stored_msg_ids:
-                    MsgId.sync(msg.msg_id, rejected)
+                    _msg_id_gen.sync(msg.msg_id, rejected)
 
                 if len(self.stored_msg_ids) > Session.STORED_MSG_IDS_MAX_SIZE:
                     cut = Session.STORED_MSG_IDS_MAX_SIZE // 2
@@ -496,7 +501,7 @@ class Session:
                             replayed = "The msg_id is equal to any of the stored values"
 
                     if replayed is None and not is_bad_notification:
-                        time_diff = (msg.msg_id >> 32) - MsgId.now()
+                        time_diff = (msg.msg_id >> 32) - _msg_id_gen.now()
 
                         if time_diff > Session.MAX_SKEW_AHEAD or time_diff < -Session.MAX_SKEW_BEHIND:
                             skew = time_diff
@@ -515,12 +520,12 @@ class Session:
 
                     if self._skew_breaches >= Session.MAX_SKEW_BREACHES:
                         self._skew_breaches = 0
-                        MsgId.sync(msg.msg_id)
+                        _msg_id_gen.sync(msg.msg_id)
 
                         log.warning(
                             "Client clock is %ss out of step with the server; "
                             "time offset resynchronised to %.1fs",
-                            int(skew), MsgId.time_offset
+                            int(skew), _msg_id_gen.time_offset
                         )
 
                     continue
