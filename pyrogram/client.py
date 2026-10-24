@@ -601,6 +601,7 @@ class Client(Methods):
         self.media_sessions = {}
         self.media_session_pools = {}
         self._media_pool_demand = {}
+        self._media_pool_demand_lock = asyncio.Lock()
         self._session_locks = {}
         self._media_sessions_locks = {}
 
@@ -1231,16 +1232,11 @@ class Client(Methods):
             for key, pts in too_long.items():
                 self._recover_too_long(key, pts)
         elif isinstance(updates, (raw.types.UpdateShortMessage, raw.types.UpdateShortChatMessage)):
-            await self._save_update_state(
-                (
-                    0,
-                    updates.pts,
-                    None,
-                    updates.date,
-                    None
-                )
-            )
-
+            # NOTE: state is saved AFTER GetDifference succeeds and the update is
+            # dispatched.  Saving it before the invoke means that if the request
+            # fails (flood wait, connection reset, server error) the pts pointer
+            # advances past a message that was never delivered and that message
+            # is silently lost on the next recover_gaps pass.
             diff = await self.invoke(
                 raw.functions.updates.GetDifference(
                     pts=updates.pts - updates.pts_count,
@@ -1262,6 +1258,16 @@ class Client(Methods):
             else:
                 if diff.other_updates:  # The other_updates list can be empty
                     await self.dispatcher.enqueue_update(diff.other_updates[0], {}, {})
+
+            await self._save_update_state(
+                (
+                    0,
+                    updates.pts,
+                    None,
+                    updates.date,
+                    None
+                )
+            )
         elif isinstance(updates, raw.types.UpdateShort):
             await self.dispatcher.enqueue_update(updates.update, {}, {})
 
@@ -2230,23 +2236,28 @@ class Client(Methods):
 
     @contextlib.asynccontextmanager
     async def _media_pool(self, dc_id: int, n: int):
-        self._media_pool_demand[dc_id] = self._media_pool_demand.get(dc_id, 0) + n
+        # _media_pool_demand is a shared counter: guard every read-modify-write so
+        # that concurrent downloads for the same DC don't race on it and produce
+        # an incorrect pool size (under-provisioned or capped too early).
+        async with self._media_pool_demand_lock:
+            self._media_pool_demand[dc_id] = self._media_pool_demand.get(dc_id, 0) + n
+            target = min(self._media_pool_demand[dc_id], self.MEDIA_POOL_CAP)
+
         task = asyncio.ensure_future(
-            self._get_media_session_pool(
-                dc_id, min(self._media_pool_demand[dc_id], self.MEDIA_POOL_CAP)
-            )
+            self._get_media_session_pool(dc_id, target)
         )
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
         try:
             yield task
         finally:
-            remaining = self._media_pool_demand.get(dc_id, n) - n
+            async with self._media_pool_demand_lock:
+                remaining = self._media_pool_demand.get(dc_id, n) - n
 
-            if remaining > 0:
-                self._media_pool_demand[dc_id] = remaining
-            else:
-                self._media_pool_demand.pop(dc_id, None)
+                if remaining > 0:
+                    self._media_pool_demand[dc_id] = remaining
+                else:
+                    self._media_pool_demand.pop(dc_id, None)
 
     async def _get_media_session_pool(self, dc_id: int, n: int) -> list:
         lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
