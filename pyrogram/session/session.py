@@ -292,7 +292,7 @@ class Session:
                     self._start_exc = e
                     await self._stop()
                     raise
-                except (Exception, asyncio.CancelledError) as e:
+                except BaseException as e:
                     self._start_exc = e
                     await self._stop()
                     raise e
@@ -313,7 +313,7 @@ class Session:
         if self is self.client.session and callable(self.client.connect_handler):
             try:
                 await self.client.connect_handler(self.client, self)
-            except (Exception, asyncio.CancelledError) as e:
+            except BaseException as e:
                 log.exception(e)
 
     async def stop(self):
@@ -330,7 +330,7 @@ class Session:
         if self.ping_task is not None:
             try:
                 await self.ping_task
-            except (Exception, asyncio.CancelledError):
+            except BaseException:
                 pass
 
         self.ping_task_event.clear()
@@ -339,7 +339,7 @@ class Session:
             self.recv_task.cancel()
             try:
                 await self.recv_task
-            except (Exception, asyncio.CancelledError):
+            except BaseException:
                 pass
 
         for task in list(self._packet_tasks):
@@ -359,7 +359,7 @@ class Session:
         if self is self.client.session and callable(self.client.disconnect_handler):
             try:
                 await self.client.disconnect_handler(self.client)
-            except (Exception, asyncio.CancelledError) as e:
+            except BaseException as e:
                 log.exception(e)
 
         log.info("Session stopped")
@@ -427,7 +427,9 @@ class Session:
                     self.auth_key,
                     self.auth_key_id
                 )
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
             log.warning("Failed to decrypt packet: %s %s", type(e).__name__, e)
             return
 
@@ -649,7 +651,9 @@ class Session:
             await self.handle_packet(packet)
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
             log.exception("Error handling packet")
         finally:
             self._packet_tasks.discard(task)
@@ -663,7 +667,9 @@ class Session:
             except TimeoutError:
                 log.debug("Socket read timed out, continuing")
                 continue
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
                 if self._teardown_started or self._stopping:
                     log.debug("Receive loop ending after a deliberate teardown")
                 else:
@@ -704,7 +710,9 @@ class Session:
     async def _safe_restart(self):
         try:
             await self.restart()
-        except (Exception, asyncio.CancelledError) as e:
+        except BaseException as e:
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
             log.error("Session restart failed: %s", e)
 
     async def send(self, data: TLObject, wait_response: bool = True, timeout: float = WAIT_TIMEOUT,
