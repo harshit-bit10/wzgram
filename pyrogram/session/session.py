@@ -263,7 +263,7 @@ class Session:
                         self._start_exc = e
                         raise
 
-                    backoff = min(e.value, 30)
+                    backoff = max(1, e.value)
                     # an unbounded start logs its way through an outage; at debug
                     # only, a client that cannot reach Telegram looks hung
                     (log.warning if attempt >= 3 else log.debug)(
