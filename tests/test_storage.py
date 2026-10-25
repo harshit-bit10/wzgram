@@ -1738,6 +1738,20 @@ class TestPeerCache:
 
         await storage.close()
 
+
+    async def test_cache_expires_cached_peer_rows(self, monkeypatch):
+        import pyrogram.storage.caching as caching
+
+        now = 10.0
+        monkeypatch.setattr(caching.time, "monotonic", lambda: now)
+        cache = PeerRowCache(size=3, cache_ttl=5)
+        cache.remember((1, 2, "user"), written=True)
+
+        assert cache.get(1) == (1, 2, "user")
+        now += 6
+        assert cache.get(1) is None
+
+
     async def test_cache_is_bounded(self):
         cache = PeerRowCache(size=3)
 
