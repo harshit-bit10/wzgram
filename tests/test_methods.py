@@ -317,6 +317,9 @@ async def test_gaps_are_recovered_only_for_the_chats_asked_for(monkeypatch):
         skip_updates = False
         storage = Storage()
         _save_update_state = pyrogram.Client._save_update_state
+        _load_update_mark = pyrogram.Client._load_update_mark
+        _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+        _recover_peer = pyrogram.Client._recover_peer
         _state_marks = {}
 
     client = Client([raw.types.updates.DifferenceEmpty(date=0, seq=0)])
@@ -337,6 +340,9 @@ async def test_no_matching_chat_recovers_nothing():
         skip_updates = False
         storage = Storage()
         _save_update_state = pyrogram.Client._save_update_state
+        _load_update_mark = pyrogram.Client._load_update_mark
+        _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+        _recover_peer = pyrogram.Client._recover_peer
         _state_marks = {}
 
     client = Client()

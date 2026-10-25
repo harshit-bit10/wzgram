@@ -653,6 +653,7 @@ def make_client(monkeypatch):
     client = Client.__new__(Client)
     client.media_session_pools = {}
     client._media_pool_demand = {}
+    client._media_pool_demand_lock = asyncio.Lock()
     client._media_sessions_locks = {}
     client._session_creation_gate = asyncio.Semaphore(4)
 

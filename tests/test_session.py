@@ -553,10 +553,10 @@ def clock(monkeypatch):
             return state["mono"]
 
     monkeypatch.setattr(msg_id_mod, "time", FakeTime)
-    monkeypatch.setattr(msg_id_mod._MsgIdGenerator, "time_offset", 0.0)
-    monkeypatch.setattr(msg_id_mod._MsgIdGenerator, "_last_msg_id", 0)
-    monkeypatch.setattr(msg_id_mod._MsgIdGenerator, "_base_wall", state["real"])
-    monkeypatch.setattr(msg_id_mod._MsgIdGenerator, "_base_mono", state["mono"])
+    monkeypatch.setattr(MsgId, "time_offset", 0.0)
+    monkeypatch.setattr(MsgId, "_last_msg_id", 0)
+    monkeypatch.setattr(MsgId, "_base_wall", state["real"])
+    monkeypatch.setattr(MsgId, "_base_mono", state["mono"])
 
     return state
 
@@ -591,8 +591,8 @@ async def test_clock_behind_does_not_kill_own_connection(clock):
     s = make_session()
 
     await feed(s, raw.types.Pong(msg_id=1, ping_id=0), server_msg_id(clock["real"]))
-    assert abs(MsgId.time_offset - 60.0) < 2, (
-        f"first server packet must set the time offset, got {MsgId.time_offset}"
+    assert abs(s.msg_factory.msg_id_gen.time_offset - 60.0) < 2, (
+        f"first server packet must set the time offset, got {s.msg_factory.msg_id_gen.time_offset}"
     )
 
     await feed(s, raw.types.Pong(msg_id=2, ping_id=0), server_msg_id(clock["real"] + 1))
@@ -626,8 +626,8 @@ async def test_bad_msg_notification_frees_the_msg_id_floor(clock):
     )
 
     assert not s.connection.closed, "the message carrying the fix must not be discarded"
-    assert abs(MsgId.time_offset + 400.0) < 2, (
-        f"error_code 17 must resync the clock, got {MsgId.time_offset}"
+    assert abs(s.msg_factory.msg_id_gen.time_offset + 400.0) < 2, (
+        f"error_code 17 must resync the clock, got {s.msg_factory.msg_id_gen.time_offset}"
     )
 
     resent = s.msg_factory(raw.functions.Ping(ping_id=0)).msg_id
@@ -667,7 +667,7 @@ async def test_a_lone_stale_packet_is_dropped_without_resyncing(clock):
 
     assert not s.connection.closed, "one stale packet must not cost a reconnect"
     assert stale not in s.stored_msg_ids, "replay protection must still drop it"
-    assert MsgId.time_offset == 0.0, (
+    assert s.msg_factory.msg_id_gen.time_offset == 0.0, (
         "a single out-of-window message must never be allowed to move the clock, "
         "or a replay could drag the whole session out of step"
     )
@@ -718,8 +718,8 @@ async def test_a_stalled_monotonic_clock_resyncs_after_repeated_breaches(clock):
     assert not s.connection.closed, (
         "a suspended host leaves CLOCK_MONOTONIC behind; that must resync, not reconnect"
     )
-    assert abs(MsgId.time_offset - 3600) < 5, (
-        f"consecutive breaches must resync the offset, got {MsgId.time_offset}"
+    assert abs(s.msg_factory.msg_id_gen.time_offset - 3600) < 5, (
+        f"consecutive breaches must resync the offset, got {s.msg_factory.msg_id_gen.time_offset}"
     )
 
     recovered = server_msg_id(resumed + 10)

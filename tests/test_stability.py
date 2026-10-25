@@ -1980,18 +1980,34 @@ async def test_an_unchanged_peer_is_not_rewritten(storage):
 
 class _StateClient:
     handle_updates = pyrogram.Client.handle_updates
+    _handle_update_container = pyrogram.Client._handle_update_container
+    _enqueue_ordered_update = pyrogram.Client._enqueue_ordered_update
+    _accept_update_sequence = pyrogram.Client._accept_update_sequence
     _save_update_state = pyrogram.Client._save_update_state
+    _load_update_mark = pyrogram.Client._load_update_mark
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
 
     def __init__(self):
         self.states = []
+        self.saved = {}
         self._state_marks = {}
+        self._state_loaded = set()
+        self._peer_recovery_locks = {}
+        self._seq_mark = None
+        self._date_mark = None
         self.enqueued = []
 
         outer = self
 
         class _Storage:
             async def update_state(self, value=object):
+                if value is object:
+                    return list(outer.saved.values())
                 outer.states.append(value)
+                if isinstance(value, int):
+                    outer.saved.pop(value, None)
+                else:
+                    outer.saved[value[0]] = value
 
         class _Dispatcher:
             async def enqueue_update(self, update, users, chats):
@@ -2278,6 +2294,7 @@ class _UnresolvableGapClient(RecoverGaps):
     """One stored channel can no longer be resolved; the others still can."""
 
     _save_update_state = pyrogram.Client._save_update_state
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
 
     def __init__(self):
         self._state_marks = {}
@@ -2399,16 +2416,27 @@ async def test_a_failed_initialize_takes_its_workers_with_it():
 
 class _StartClient:
     start = pyrogram.Client.start
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+    _save_update_state = pyrogram.Client._save_update_state
 
     def __init__(self):
         self.takeout = False
         self.takeout_id = None
         self.disconnected = False
         self.me = None
+        self._state_marks = {}
+        self._state_loaded = set()
+        self._peer_recovery_locks = {}
+        self._seq_mark = None
+        self._date_mark = None
 
         class _Storage:
             async def is_bot(self):
                 return True
+
+            async def update_state(self, value=object):
+                if value is object:
+                    return []
 
         self.storage = _Storage()
 
@@ -2416,7 +2444,7 @@ class _StartClient:
         return True
 
     async def invoke(self, query, **kwargs):
-        return None
+        return SimpleNamespace(pts=1, qts=0, date=1, seq=1)
 
     async def get_me(self):
         raise RuntimeError("the server hung up right after GetState")
