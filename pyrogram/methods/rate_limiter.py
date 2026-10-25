@@ -191,18 +191,22 @@ class RateLimiter:
     def acquire_nowait(self, category: str, tokens: float = 1.0) -> bool:
         if self._closed:
             return True
+
         bucket = self._buckets.get(category)
-        if bucket:
-            saved = (bucket._last_refill, bucket._tokens)
+        if self._global._lock.locked() or (bucket is not None and bucket._lock.locked()):
+            return False
+
+        if bucket is not None:
             if not bucket._try_consume(tokens):
                 return False
+
             if not self._global._try_consume(tokens):
-                bucket._last_refill, bucket._tokens = saved
+                bucket._tokens = min(bucket._burst, bucket._tokens + tokens)
                 bucket._total_taken -= tokens
                 return False
-        else:
-            if not self._global._try_consume(tokens):
-                return False
+        elif not self._global._try_consume(tokens):
+            return False
+
         return True
 
     def congestion(self) -> float:
