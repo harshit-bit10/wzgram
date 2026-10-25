@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pyrogram import raw
 
 from .caching import PEER_CACHE_SIZE, PeerRowCache, SessionAttrCache, get_input_peer
-from .storage import Storage
+from .storage import Storage, _UNSET
 
 log = logging.getLogger(__name__)
 
@@ -236,9 +236,9 @@ class RemoteStorage(Storage):
         await self._replace_usernames(usernames)
 
     async def update_state(
-        self, value: Tuple[int, int, int, int, int] = object
+        self, value: Tuple[int, int, int, int, int] = _UNSET
     ) -> Optional[List[Tuple[int, int, int, int, int]]]:
-        if value is object:
+        if value is _UNSET:
             return await self._load_states()
 
         if isinstance(value, int):
@@ -306,62 +306,62 @@ class RemoteStorage(Storage):
         await self._save_session({attr: value})
         self._cache.set(attr, value)
 
-    async def dc_id(self, value: int = object):
-        if value is object:
+    async def dc_id(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("dc_id")
         await self._write_attr("dc_id", value)
         return value
 
-    async def server_address(self, value: str = object):
-        if value is object:
+    async def server_address(self, value: str = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("server_address")
         await self._write_attr("server_address", value)
         return value
 
-    async def port(self, value: int = object):
-        if value is object:
+    async def port(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("port")
         await self._write_attr("port", value)
         return value
 
-    async def api_id(self, value: int = object):
-        if value is object:
+    async def api_id(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("api_id")
         await self._write_attr("api_id", value)
         return value
 
-    async def test_mode(self, value: bool = object):
-        if value is object:
+    async def test_mode(self, value: bool = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("test_mode")
         await self._write_attr("test_mode", value)
         return value
 
-    async def auth_key(self, value: bytes = object):
-        if value is object:
+    async def auth_key(self, value: bytes = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("auth_key")
         await self._write_attr("auth_key", value)
         return value
 
-    async def date(self, value: int = object):
-        if value is object:
+    async def date(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("date")
         await self._write_attr("date", value)
         return value
 
-    async def user_id(self, value: int = object):
-        if value is object:
+    async def user_id(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("user_id")
         await self._write_attr("user_id", value)
         return value
 
-    async def is_bot(self, value: bool = object):
-        if value is object:
+    async def is_bot(self, value: bool = _UNSET):
+        if value is _UNSET:
             return await self._read_attr("is_bot")
         await self._write_attr("is_bot", value)
         return value
 
-    async def version(self, value: int = object):
-        if value is object:
+    async def version(self, value: int = _UNSET):
+        if value is _UNSET:
             return await self._load_version()
         await self._save_version(value)
         return value
