@@ -18,7 +18,7 @@
 
 import asyncio
 import time
-from typing import Dict, Optional
+from typing import Optional
 
 
 class TokenBucket:
@@ -47,8 +47,9 @@ class TokenBucket:
     def _refill(self):
         now = time.monotonic()
         elapsed = now - self._last_refill
-        self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
-        self._last_refill = now
+        if elapsed > 0:
+            self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+            self._last_refill = now
 
     def _try_consume(self, tokens: float = 1.0) -> bool:
         self._refill()
@@ -136,7 +137,7 @@ class RateLimiter:
         CATEGORY_ACCOUNT: {"rate": 10.0, "burst": 15.0},
     }
 
-    def __init__(self, limits: Optional[Dict[str, Dict[str, float]]] = None):
+    def __init__(self, limits: Optional[dict[str, dict[str, float]]] = None):
         resolved = {k: dict(v) for k, v in self.DEFAULT_LIMITS.items()}
         if limits:
             for cat, cfg in limits.items():
@@ -145,7 +146,7 @@ class RateLimiter:
                 else:
                     resolved[cat] = cfg
 
-        self._buckets: Dict[str, TokenBucket] = {}
+        self._buckets: dict[str, TokenBucket] = {}
         self._global = TokenBucket(
             rate=resolved.get("global", {}).get("rate", 30.0),
             burst=resolved.get("global", {}).get("burst", 40.0),
@@ -188,7 +189,7 @@ class RateLimiter:
         return max(scores) if scores else 0.0
 
     @property
-    def available(self) -> Dict[str, float]:
+    def available(self) -> dict[str, float]:
         result = {k: b.available for k, b in self._buckets.items()}
         result["global"] = self._global.available
         return result
