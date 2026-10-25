@@ -142,7 +142,9 @@ class Connection:
                 last_error = e
                 log.warning("Unable to connect due to network issues: %s", e)
                 await self.protocol.close()
-                await asyncio.sleep(1)
+                # Exponential backoff: 1s, 2s, 4s … capped at 8s so three
+                # retries don't stall a restart for half a minute.
+                await asyncio.sleep(min(2 ** i, 8))
             else:
                 log.info("Connected! %s DC%s%s - IPv%s",
                          "Test" if self.test_mode else "Production",
