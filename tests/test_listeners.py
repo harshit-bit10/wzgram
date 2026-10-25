@@ -481,6 +481,7 @@ async def test_conversations_inside_handlers_do_not_starve_the_worker_pool():
     workers = 2
     conversations = workers + 2
     client, dispatcher = dispatcher_client(workers=workers)
+    dispatcher.updates_queue = asyncio.Queue(maxsize=workers)
     replies = []
 
     async def converse(_, msg):
@@ -495,7 +496,9 @@ async def test_conversations_inside_handlers_do_not_starve_the_worker_pool():
         for chat_id in range(conversations):
             packet = DummyUpdate()
             packet.parsed = message(chat_id=chat_id, message_id=1)
-            await dispatcher.enqueue_update(packet, {}, {})
+            await asyncio.wait_for(
+                dispatcher.enqueue_update(packet, {}, {}), timeout=2
+            )
 
         for _ in range(50):
             await asyncio.sleep(0.02)
@@ -512,7 +515,9 @@ async def test_conversations_inside_handlers_do_not_starve_the_worker_pool():
         for chat_id in range(conversations):
             packet = DummyUpdate()
             packet.parsed = message(chat_id=chat_id, message_id=2)
-            await dispatcher.enqueue_update(packet, {}, {})
+            await asyncio.wait_for(
+                dispatcher.enqueue_update(packet, {}, {}), timeout=2
+            )
 
         for _ in range(100):
             await asyncio.sleep(0.02)
