@@ -23,13 +23,14 @@ from typing import Iterable, Optional, Tuple, Union
 import pyrogram
 from pyrogram import raw
 from pyrogram.errors import ChannelInvalid, ChannelPrivate, PeerIdInvalid, PersistentTimestampInvalid, PersistentTimestampOutdated
-from pyrogram.utils import ZERO_CHANNEL_ID
+from pyrogram.utils import ZERO_CHANNEL_ID, get_channel_id
 
 log = logging.getLogger(__name__)
 
 
 class RecoverGaps:
     MAX_STALE_TIMESTAMP_RETRIES = 3
+    MAX_PARALLEL_RECOVERIES = 8
 
     async def recover_gaps(
         self: "pyrogram.Client",
@@ -78,25 +79,27 @@ class RecoverGaps:
 
         async def _run_one(local_state) -> Tuple[int, int]:
             id = local_state[0]
-            peer_lock = self._peer_recovery_locks.setdefault(id, asyncio.Lock())
+            peer_lock = self._peer_recovery_lock(id)
             return await self._recover_peer(id, peer_lock)
 
-        raw_results = await asyncio.gather(
-            *(_run_one(state) for state in eligible),
-            return_exceptions=True,
-        )
         results = []
-        for result in raw_results:
-            if isinstance(result, BaseException):
-                if not isinstance(result, Exception):
-                    raise result
-                log.error(
-                    "Gap recovery task failed: %s",
-                    result,
-                    exc_info=(type(result), result, result.__traceback__)
-                )
-                continue
-            results.append(result)
+        for start in range(0, len(eligible), RecoverGaps.MAX_PARALLEL_RECOVERIES):
+            batch = eligible[start:start + RecoverGaps.MAX_PARALLEL_RECOVERIES]
+            raw_results = await asyncio.gather(
+                *(_run_one(state) for state in batch),
+                return_exceptions=True,
+            )
+            for result in raw_results:
+                if isinstance(result, BaseException):
+                    if not isinstance(result, Exception):
+                        raise result
+                    log.error(
+                        "Gap recovery task failed: %s",
+                        result,
+                        exc_info=(type(result), result, result.__traceback__)
+                    )
+                    continue
+                results.append(result)
 
         for msgs, upds in results:
             message_updates_counter += msgs
@@ -120,6 +123,18 @@ class RecoverGaps:
                 return (0, 0)
 
             _, local_pts, local_qts, local_date, local_seq = local_state
+            known_pts, known_qts = self._state_marks.get(id, (None, None))
+            if known_pts is not None and (local_pts is None or known_pts > local_pts):
+                local_pts = known_pts
+            if known_qts is not None and (local_qts is None or known_qts > local_qts):
+                local_qts = known_qts
+            if id == 0:
+                known_seq = getattr(self, "_seq_mark", None)
+                known_date = getattr(self, "_date_mark", None)
+                if known_seq is not None and (local_seq is None or known_seq > local_seq):
+                    local_seq = known_seq
+                if known_date is not None and (local_date is None or known_date > local_date):
+                    local_date = known_date
             stale_attempts = 0
             unusable = False
             failed = False
@@ -129,6 +144,8 @@ class RecoverGaps:
                     if local_pts is None:
                         state = await self.invoke(raw.functions.updates.GetState())
                         local_pts, local_date, local_seq = state.pts, state.date, state.seq
+                        if local_qts is None:
+                            local_qts = state.qts
 
                     request = (local_pts, local_qts)
 
@@ -154,11 +171,11 @@ class RecoverGaps:
                     stale_attempts += 1
 
                     if stale_attempts >= RecoverGaps.MAX_STALE_TIMESTAMP_RETRIES:
-                        log.info(
-                            "Dropping the stored state of %s: %s after %s attempts",
-                            id, e.ID, stale_attempts
+                        log.warning(
+                            "Keeping the stored state of %s after repeated %s errors",
+                            id, e.ID
                         )
-                        unusable = True
+                        failed = True
                         break
 
                     await asyncio.sleep(stale_attempts)
@@ -180,6 +197,11 @@ class RecoverGaps:
                     )
                     break
                 elif isinstance(diff, raw.types.updates.DifferenceTooLong):
+                    if diff.pts <= local_pts:
+                        log.warning("GetDifferenceTooLong made no progress for %s", id)
+                        failed = True
+                        break
+
                     local_pts = diff.pts
                     await self._save_update_state(
                         (
@@ -213,15 +235,20 @@ class RecoverGaps:
                     )
                     break
                 elif isinstance(diff, raw.types.updates.ChannelDifferenceTooLong):
-                    pts_from_dialog = getattr(diff.dialog, "pts", None)
+                    pts_from_dialog = getattr(getattr(diff, "dialog", None), "pts", None)
 
                     if pts_from_dialog is None:
                         log.warning(
                             "Channel %s returned no pts in ChannelDifferenceTooLong; "
-                            "skipping recovery",
+                            "keeping the current state",
                             id,
                         )
-                        unusable = True
+                        failed = True
+                        break
+
+                    if pts_from_dialog <= local_pts:
+                        log.warning("ChannelDifferenceTooLong made no progress for %s", id)
+                        failed = True
                         break
 
                     local_pts = pts_from_dialog
@@ -262,6 +289,8 @@ class RecoverGaps:
                         log.warning("Update queue rejected a recovered update; keeping the old pts")
                         return (message_updates_counter, other_updates_counter)
                     other_updates_counter += 1
+                    if isinstance(update, raw.types.UpdateChannelTooLong):
+                        self._recover_too_long(get_channel_id(update.channel_id), update.pts)
 
                 if isinstance(diff, raw.types.updates.Difference):
                     break
