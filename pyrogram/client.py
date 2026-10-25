@@ -60,6 +60,10 @@ from pyrogram.errors import (
 from pyrogram.handlers.handler import Handler
 from pyrogram.methods import Methods
 from pyrogram.methods.rate_limiter import AdaptiveBucket, TokenBucket
+from pyrogram.methods.advanced.update_helpers import (
+    encrypted_updates,
+    ordered_difference_updates,
+)
 from pyrogram.qrlogin import QRLogin
 from pyrogram.session import Auth, Session
 from pyrogram.storage import SQLiteStorage, Storage
@@ -1463,9 +1467,8 @@ class Client(Methods):
                 None,
             ))
 
-        if seq_ok:
-            for key, pts in too_long.items():
-                self._recover_too_long(key, pts)
+        for key, pts in too_long.items():
+            self._recover_too_long(key, pts)
 
     async def handle_updates(self, updates):
         if getattr(self, "no_updates", False):
@@ -1487,7 +1490,7 @@ class Client(Methods):
                 pts = known_pts if known_pts is not None else updates.pts - updates.pts_count
                 if known_pts is None:
                     self._state_marks[0] = (pts, known_qts)
-                await self._handle_short_update(updates, pts)
+                await self._handle_short_update(updates, pts, known_qts)
         elif isinstance(updates, raw.types.UpdateShort):
             update = updates.update
             qts = getattr(update, "qts", None)
@@ -1496,9 +1499,12 @@ class Client(Methods):
                 await self._save_update_state((0, None, qts, updates.date, None))
         elif isinstance(updates, raw.types.UpdatesTooLong):
             self._recover_too_long(0, None)
-    async def _handle_short_update(self, update, pts):
+    async def _handle_short_update(self, update, pts, qts=None):
         date = update.date
-        qts = -1
+        if qts is None:
+            qts = self._state_marks.get(0, (None, None))[1]
+        if qts is None:
+            qts = 0
 
         try:
             while True:
@@ -1507,11 +1513,11 @@ class Client(Methods):
                     raw.functions.updates.GetDifference(pts=pts, date=date, qts=qts)
                 )
                 if isinstance(diff, raw.types.updates.DifferenceEmpty):
-                    await self._save_update_state((0, pts, None, diff.date, diff.seq))
+                    await self._save_update_state((0, pts, qts, diff.date, diff.seq))
                     return
 
                 if isinstance(diff, raw.types.updates.DifferenceTooLong):
-                    await self._save_update_state((0, diff.pts, None, date, None))
+                    await self._save_update_state((0, diff.pts, qts, date, None))
                     self._recover_too_long(0, None)
                     return
 
@@ -1525,8 +1531,15 @@ class Client(Methods):
                     log.warning("Unexpected GetDifference response: %s", type(diff).__name__)
                     return
 
+                encrypted = encrypted_updates(diff, qts, state.qts)
+                if encrypted is None:
+                    log.warning("Could not map encrypted-message QTS values; keeping the old state")
+                    return
+
                 users = {u.id: u for u in diff.users}
                 chats = {c.id: c for c in diff.chats}
+                await self.fetch_peers(diff.users)
+                await self.fetch_peers(diff.chats)
 
                 for message in diff.new_messages:
                     queued = await self.dispatcher.enqueue_update(
@@ -1538,7 +1551,7 @@ class Client(Methods):
                         log.warning("Update queue rejected a recovered message; keeping the old pts")
                         return
 
-                for item in diff.other_updates:
+                for item in ordered_difference_updates(diff.other_updates, encrypted):
                     if not await self.dispatcher.enqueue_update(item, users, chats):
                         log.warning("Update queue rejected a recovered update; keeping the old pts")
                         return
@@ -1592,6 +1605,7 @@ class Client(Methods):
                     ))
                 elif pts is not None:
                     await self._save_update_state((key, pts, None, None, None))
+                    should_recover = True
 
             if should_recover:
                 await self.recover_gaps(key)
