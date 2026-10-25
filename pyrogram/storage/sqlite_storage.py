@@ -34,6 +34,12 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+# Sentinel used as a "no value supplied" default.  Using the builtin `object`
+# class itself as a default breaks type checkers and mypy: a value typed as
+# `int` would accept `object` at the call site with no complaint.  A dedicated
+# singleton is explicit and carries no false assignability.
+_MISSING = object()
+
 
 SCHEMA = """
 CREATE TABLE sessions
@@ -395,19 +401,22 @@ class SQLiteStorage(Storage):
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         if not usernames or self.conn is None:
             return
-        await self.conn.executemany("DELETE FROM usernames WHERE id = ?", [(id,) for id, _ in usernames])
+        await self.conn.executemany("DELETE FROM usernames WHERE id = ?", [(uid,) for uid, _ in usernames])
 
         await self.conn.executemany(
             "REPLACE INTO usernames (id, username) VALUES (?, ?)",
-            [(id, username) for id, usernames in usernames for username in usernames],
+            # `usernames` (outer param) was shadowed by the loop variable here,
+            # which made the list comprehension silently iterate over the strings
+            # in the last peer's username list instead of the full input.
+            [(uid, uname) for uid, unames in usernames for uname in unames],
         )
         await self._maybe_commit()
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
+    async def update_state(self, value: Tuple[int, int, int, int, int] = _MISSING):
         if self.conn is None:
-            return [] if value is object else None
+            return [] if value is _MISSING else None
 
-        if value is object:
+        if value is _MISSING:
             cursor = await self.conn.execute(
                 "SELECT id, pts, qts, date, seq FROM update_state ORDER BY date ASC"
             )
@@ -488,7 +497,14 @@ class SQLiteStorage(Storage):
         async with self.conn.execute(sql, params) as cursor:
             return await cursor.fetchone()
 
+    _SESSION_COLUMNS = frozenset({
+        "dc_id", "server_address", "port", "api_id",
+        "test_mode", "auth_key", "date", "user_id", "is_bot",
+    })
+
     async def _read_attr(self, attr: str):
+        if attr not in self._SESSION_COLUMNS:
+            raise ValueError(f"Unknown session column: {attr!r}")
         if self.conn is None:
             raise ConnectionError("Database is not open")
         if attr in self._cache:
@@ -498,70 +514,72 @@ class SQLiteStorage(Storage):
         return self._cache.get(attr)
 
     async def _write_attr(self, attr: str, value: Any):
+        if attr not in self._SESSION_COLUMNS:
+            raise ValueError(f"Unknown session column: {attr!r}")
         if self.conn is None:
             raise ConnectionError("Database is not open")
         await self.conn.execute(f"UPDATE sessions SET {attr} = ?", (value,))
         self._cache.set(attr, value)
         await self._maybe_commit()
 
-    async def dc_id(self, value: int = object):
-        if value is object:
+    async def dc_id(self, value: int = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("dc_id")
         await self._write_attr("dc_id", value)
         return value
 
-    async def server_address(self, value: str = object):
-        if value is object:
+    async def server_address(self, value: str = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("server_address")
         await self._write_attr("server_address", value)
         return value
 
-    async def port(self, value: int = object):
-        if value is object:
+    async def port(self, value: int = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("port")
         await self._write_attr("port", value)
         return value
 
-    async def api_id(self, value: int = object):
-        if value is object:
+    async def api_id(self, value: int = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("api_id")
         await self._write_attr("api_id", value)
         return value
 
-    async def test_mode(self, value: bool = object):
-        if value is object:
+    async def test_mode(self, value: bool = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("test_mode")
         await self._write_attr("test_mode", value)
         return value
 
-    async def auth_key(self, value: bytes = object):
-        if value is object:
+    async def auth_key(self, value: bytes = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("auth_key")
         await self._write_attr("auth_key", value)
         return value
 
-    async def date(self, value: int = object):
-        if value is object:
+    async def date(self, value: int = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("date")
         await self._write_attr("date", value)
         return value
 
-    async def user_id(self, value: int = object):
-        if value is object:
+    async def user_id(self, value: int = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("user_id")
         await self._write_attr("user_id", value)
         return value
 
-    async def is_bot(self, value: bool = object):
-        if value is object:
+    async def is_bot(self, value: bool = _MISSING):
+        if value is _MISSING:
             return await self._read_attr("is_bot")
         await self._write_attr("is_bot", value)
         return value
 
-    async def version(self, value: int = object):
+    async def version(self, value: int = _MISSING):
         if self.conn is None:
             raise ConnectionError("Database is not open")
-        if value is object:
+        if value is _MISSING:
             row = await self._fetchone("SELECT number FROM version")
             return row[0] if row else None
         else:
