@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 SESSION_STRING_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 SESSION_STRING_DECODE = {c: i for i, c in enumerate(SESSION_STRING_ALPHABET)}
 WZ_PREFIX = "WZ_"
+_UNSET = object()
 
 TEST = {
     1: "149.154.175.10",
@@ -83,7 +84,7 @@ class Storage(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def update_state(self, update_state: Tuple[int, int, int, int, int] = object) -> Tuple[int, int, int, int, int]:
+    async def update_state(self, update_state: Tuple[int, int, int, int, int] = _UNSET) -> Tuple[int, int, int, int, int]:
         raise NotImplementedError
 
     @abstractmethod
@@ -99,39 +100,39 @@ class Storage(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def dc_id(self, value: int = object) -> int:
+    async def dc_id(self, value: int = _UNSET) -> int:
         raise NotImplementedError
 
     @abstractmethod
-    async def api_id(self, value: int = object) -> int:
+    async def api_id(self, value: int = _UNSET) -> int:
         raise NotImplementedError
 
     @abstractmethod
-    async def server_address(self, value: str = object) -> str:
+    async def server_address(self, value: str = _UNSET) -> str:
         raise NotImplementedError
 
     @abstractmethod
-    async def port(self, value: int = object) -> int:
+    async def port(self, value: int = _UNSET) -> int:
         raise NotImplementedError
 
     @abstractmethod
-    async def test_mode(self, value: bool = object) -> bool:
+    async def test_mode(self, value: bool = _UNSET) -> bool:
         raise NotImplementedError
 
     @abstractmethod
-    async def auth_key(self, value: bytes = object) -> bytes:
+    async def auth_key(self, value: bytes = _UNSET) -> bytes:
         raise NotImplementedError
 
     @abstractmethod
-    async def date(self, value: int = object) -> int:
+    async def date(self, value: int = _UNSET) -> int:
         raise NotImplementedError
 
     @abstractmethod
-    async def user_id(self, value: int = object) -> int:
+    async def user_id(self, value: int = _UNSET) -> int:
         raise NotImplementedError
 
     @abstractmethod
-    async def is_bot(self, value: bool = object) -> bool:
+    async def is_bot(self, value: bool = _UNSET) -> bool:
         raise NotImplementedError
 
     @staticmethod
