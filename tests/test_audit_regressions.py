@@ -38,12 +38,31 @@ class _DispatcherClient:
     def __init__(self):
         self.loop = asyncio.get_event_loop()
 
-    async def recover_gaps(self):
+    async def recover_gaps(self, ids=None):
         return (0, 0)
 
 
 def make_dispatcher():
     return Dispatcher(_DispatcherClient())
+
+
+async def test_start_recovers_global_updates_before_saved_peers():
+    client = _DispatcherClient()
+    client.skip_updates = False
+    client.workers = 0
+    client.storage = SimpleNamespace(update_state=AsyncMock(return_value=[
+        (0, 10, 2, 50, 4),
+        (-1000000000001, 20, None, None, None),
+        (-1000000000002, 30, None, None, None),
+    ]))
+    client.recover_gaps = AsyncMock(return_value=(0, 0))
+
+    await Dispatcher(client).start()
+
+    assert [call.args for call in client.recover_gaps.await_args_list] == [
+        (0,),
+        ([-1000000000001, -1000000000002],),
+    ]
 
 
 async def test_a_dispatcher_cycle_does_not_grow_its_lock_list():
@@ -4069,6 +4088,9 @@ async def test_an_ephemeral_message_without_media_keeps_its_text():
 
 
 class _GapClient:
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+    _recover_peer = __import__("pyrogram.methods.advanced.recover_gaps", fromlist=["RecoverGaps"]).RecoverGaps._recover_peer
+
     def __init__(self, states, replies):
         from pyrogram.methods.advanced.recover_gaps import RecoverGaps
 
@@ -4146,6 +4168,35 @@ async def test_a_partial_channel_difference_that_does_not_move_stops():
     await asyncio.wait_for(client.recover_gaps(), timeout=5)
 
     assert len(client.sent) == 1
+
+
+async def test_a_too_long_difference_that_does_not_advance_keeps_the_cursor():
+    from pyrogram import raw
+
+    client = _GapClient([(0, 100, 50, 7, 1)], [
+        raw.types.updates.DifferenceTooLong(pts=100),
+    ])
+
+    await asyncio.wait_for(client.recover_gaps(), timeout=5)
+
+    assert len(client.sent) == 1
+    assert client.written == []
+
+
+async def test_recovery_keeps_saved_qts_when_pts_is_missing():
+    from pyrogram import raw
+
+    client = _GapClient([(0, None, 50, 7, 1)], [
+        _state(40, 60),
+        raw.types.updates.DifferenceEmpty(date=8, seq=2),
+    ])
+
+    await client.recover_gaps()
+
+    request = client.sent[-1]
+    assert request.pts == 40
+    assert request.qts == 50
+    assert client.written[-1][2] == 50
 
 
 def _state(pts, qts):
@@ -4238,7 +4289,13 @@ async def test_a_channel_state_without_pts_is_still_skipped():
 
 class _QtsClient:
     handle_updates = pyrogram.Client.handle_updates
+    _handle_update_container = pyrogram.Client._handle_update_container
     _save_update_state = pyrogram.Client._save_update_state
+    _load_update_mark = pyrogram.Client._load_update_mark
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+    _enqueue_ordered_update = pyrogram.Client._enqueue_ordered_update
+    _accept_update_sequence = pyrogram.Client._accept_update_sequence
+    _handle_short_update = pyrogram.Client._handle_short_update
 
     def __init__(self):
         self.states = []
@@ -4248,6 +4305,8 @@ class _QtsClient:
 
         class _Storage:
             async def update_state(self, value=object):
+                if value is object:
+                    return [state for state in outer.states if isinstance(state, tuple)]
                 outer.states.append(value)
 
         class _Dispatcher:
@@ -4261,6 +4320,260 @@ class _QtsClient:
         return False
 
 
+class _StartStateClient:
+    from pyrogram.methods.utilities.start import Start
+    start = Start.start
+    _save_update_state = pyrogram.Client._save_update_state
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+
+    def __init__(self, states=()):
+        from types import SimpleNamespace
+
+        self.states = {row[0]: row for row in states}
+        self._state_marks = {}
+        self._state_loaded = set()
+        self._seq_mark = None
+        self._date_mark = None
+        self._peer_recovery_locks = None
+        self.takeout = False
+        self.state_response = SimpleNamespace(pts=99, qts=10, date=100, seq=11)
+
+        outer = self
+
+        class _Storage:
+            async def update_state(self, value=object):
+                if value is object:
+                    return list(outer.states.values())
+                if isinstance(value, int):
+                    outer.states.pop(value, None)
+                    return
+                state_id, pts, qts, date, seq = value
+                old = outer.states.get(state_id, (state_id, None, None, None, None))
+                outer.states[state_id] = (
+                    state_id,
+                    old[1] if pts is None else pts,
+                    old[2] if qts is None else qts,
+                    old[3] if date is None else date,
+                    old[4] if seq is None else seq,
+                )
+
+            async def is_bot(self):
+                return True
+
+        self.storage = _Storage()
+
+    async def connect(self):
+        return True
+
+    async def invoke(self, query, **kwargs):
+        return self.state_response
+
+    async def get_me(self):
+        return object()
+
+    async def initialize(self):
+        pass
+
+    async def disconnect(self):
+        pass
+
+
+async def test_start_saves_a_baseline_when_no_global_state_exists():
+    client = _StartStateClient()
+
+    await client.start()
+
+    assert client.states[0] == (0, 99, 10, 100, 11)
+
+
+async def test_start_does_not_replace_a_saved_update_cursor():
+    client = _StartStateClient([(0, 10, 2, 50, 4)])
+
+    await client.start()
+
+    assert client.states[0] == (0, 10, 2, 50, 4)
+
+
+class _UpdateOrderClient:
+    handle_updates = pyrogram.Client.handle_updates
+    _handle_update_container = pyrogram.Client._handle_update_container
+    _save_update_state = pyrogram.Client._save_update_state
+    _load_update_mark = pyrogram.Client._load_update_mark
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+    _enqueue_ordered_update = pyrogram.Client._enqueue_ordered_update
+    _accept_update_sequence = pyrogram.Client._accept_update_sequence
+
+    def __init__(self, states=(), recover_seq=None, recover_pts=None):
+        self.states = {row[0]: row for row in states}
+        self._state_marks = {}
+        self._state_loaded = set()
+        self._seq_mark = None
+        self._date_mark = None
+        self._updates_seq_lock = asyncio.Lock()
+        self._recovering = set()
+        self.no_updates = False
+        self.skip_updates = True
+        self.recover_seq = recover_seq
+        self.recover_pts = recover_pts or {}
+        self.recover_calls = []
+        self.scheduled = []
+        self.enqueued = []
+        self.sent = []
+
+        outer = self
+
+        class _Storage:
+            async def update_state(self, value=object):
+                if value is object:
+                    return list(outer.states.values())
+                if isinstance(value, int):
+                    outer.states.pop(value, None)
+                    return
+
+                state_id, pts, qts, date, seq = value
+                old = outer.states.get(state_id, (state_id, None, None, None, None))
+                outer.states[state_id] = (
+                    state_id,
+                    old[1] if pts is None else pts,
+                    old[2] if qts is None else qts,
+                    old[3] if date is None else date,
+                    old[4] if seq is None else seq,
+                )
+
+        class _Dispatcher:
+            async def enqueue_update(self, update, users, chats):
+                outer.enqueued.append(update)
+                return True
+
+        self.storage = _Storage()
+        self.dispatcher = _Dispatcher()
+
+    async def fetch_peers(self, peers):
+        return False
+
+    async def resolve_peer(self, peer_id):
+        return raw.types.InputChannel(channel_id=abs(peer_id), access_hash=0)
+
+    async def invoke(self, query, **kwargs):
+        self.sent.append(query)
+        raise RuntimeError("unexpected invoke in update-order test")
+
+    async def recover_gaps(self, ids=None):
+        self.recover_calls.append(ids)
+        if ids == 0 and self.recover_seq is not None:
+            old = self.states.get(0, (0, None, None, None, None))
+            await self._save_update_state((0, old[1], old[2], old[3], self.recover_seq))
+        elif ids in self.recover_pts:
+            old = self.states.get(ids, (ids, None, None, None, None))
+            await self._save_update_state((ids, self.recover_pts[ids], old[2], old[3], old[4]))
+        return (0, 0)
+
+    def _recover_too_long(self, key, pts):
+        self.scheduled.append((key, pts))
+
+
+async def test_a_sequence_gap_holds_unsequenced_updates_until_recovery():
+    from pyrogram import raw
+
+    update = raw.types.UpdateUserStatus(
+        user_id=1, status=raw.types.UserStatusOnline(expires=1700000010)
+    )
+    client = _UpdateOrderClient([(0, 5, 1, 1700000000, 2)], recover_seq=3)
+
+    await client.handle_updates(raw.types.UpdatesCombined(
+        updates=[update], users=[], chats=[], date=1700000001, seq_start=4, seq=4
+    ))
+
+    assert client.recover_calls == [0]
+    assert client.enqueued == [update]
+    assert client.states[0][4] == 4
+
+
+async def test_an_unfilled_sequence_gap_does_not_dispatch_or_advance_seq():
+    from pyrogram import raw
+
+    update = raw.types.UpdateUserStatus(
+        user_id=1, status=raw.types.UserStatusOnline(expires=1700000010)
+    )
+    client = _UpdateOrderClient([(0, 5, 1, 1700000000, 2)])
+
+    await client.handle_updates(raw.types.UpdatesCombined(
+        updates=[update], users=[], chats=[], date=1700000001, seq_start=4, seq=4
+    ))
+
+    assert client.recover_calls == [0, 0]
+    assert client.enqueued == []
+    assert client.states[0][4] == 2
+
+
+async def test_message_box_pts_is_applied_even_when_top_level_seq_has_a_gap():
+    from pyrogram import raw
+
+    message_update = raw.types.UpdateNewMessage(
+        message=raw.types.MessageEmpty(id=7), pts=6, pts_count=1
+    )
+    status_update = raw.types.UpdateUserStatus(
+        user_id=1, status=raw.types.UserStatusOnline(expires=1700000010)
+    )
+    client = _UpdateOrderClient([(0, 5, 1, 1700000000, 2)])
+
+    await client.handle_updates(raw.types.UpdatesCombined(
+        updates=[message_update, status_update], users=[], chats=[],
+        date=1700000001, seq_start=4, seq=4
+    ))
+
+    assert client.enqueued == [message_update]
+    assert client.states[0][1] == 6
+    assert client.states[0][4] == 2
+
+
+async def test_channel_pts_gap_is_recovered_before_the_update_is_enqueued():
+    from pyrogram import raw
+
+    channel_key = utils.get_channel_id(5)
+    update = raw.types.UpdateNewChannelMessage(
+        message=raw.types.Message(
+            id=7, peer_id=raw.types.PeerChannel(channel_id=5), date=0,
+            message="m", entities=[], restriction_reason=[]
+        ),
+        pts=13, pts_count=1,
+    )
+    client = _UpdateOrderClient(
+        [(channel_key, 10, None, None, None)], recover_pts={channel_key: 12}
+    )
+
+    await client.handle_updates(raw.types.Updates(
+        updates=[update], users=[], chats=[], date=1700000001, seq=0
+    ))
+
+    assert client.recover_calls == [channel_key]
+    assert client.enqueued == [update]
+    assert client.states[channel_key][1] == 13
+
+
+async def test_channel_pts_gap_that_cannot_be_recovered_is_not_advanced():
+    from pyrogram import raw
+
+    channel_key = utils.get_channel_id(5)
+    update = raw.types.UpdateNewChannelMessage(
+        message=raw.types.Message(
+            id=7, peer_id=raw.types.PeerChannel(channel_id=5), date=0,
+            message="m", entities=[], restriction_reason=[]
+        ),
+        pts=13, pts_count=1,
+    )
+    client = _UpdateOrderClient([(channel_key, 10, None, None, None)])
+
+    await client.handle_updates(raw.types.Updates(
+        updates=[update], users=[], chats=[], date=1700000001, seq=0
+    ))
+
+    assert client.recover_calls == [channel_key, channel_key]
+    assert client.enqueued == []
+    assert client.states[channel_key][1] == 10
+    assert client.scheduled == [(channel_key, 13)]
+
+
 async def test_the_highest_qts_of_a_batch_is_stored_in_the_common_state():
     from pyrogram import raw
 
@@ -4270,9 +4583,9 @@ async def test_the_highest_qts_of_a_batch_is_stored_in_the_common_state():
         updates=[
             raw.types.UpdateBotStopped(user_id=1, date=0, stopped=True, qts=41),
             raw.types.UpdateChannelParticipant(
-                channel_id=5, date=0, actor_id=1, user_id=2, qts=43
+                channel_id=5, date=0, actor_id=1, user_id=2, qts=42
             ),
-            raw.types.UpdateBotStopped(user_id=1, date=0, stopped=False, qts=42),
+            raw.types.UpdateBotStopped(user_id=1, date=0, stopped=False, qts=43),
             raw.types.UpdateNewMessage(message=raw.types.MessageEmpty(id=1), pts=9, pts_count=1),
         ],
         users=[], chats=[], date=1700000000, seq=4,
@@ -4309,7 +4622,7 @@ async def test_a_batch_that_arrives_late_does_not_move_the_state_back():
     await client.handle_updates(_pts_batch(11))
     await client.handle_updates(_pts_batch(13))
 
-    assert [state[1] for state in client.states] == [12, 13]
+    assert [state[1] for state in client.states if state[1] is not None] == [12, 13]
 
 
 async def test_a_short_message_that_arrives_late_does_not_move_the_state_back():
@@ -4425,8 +4738,9 @@ class _SkipWatchdogClient:
     async def invoke(self, query, **kwargs):
         self.polls += 1
 
-    async def recover_gaps(self):
+    async def recover_gaps(self, ids=None):
         self.recoveries += 1
+        self.recovery_ids = getattr(self, "recovery_ids", []) + [ids]
         return (0, 0)
 
 
@@ -4441,6 +4755,8 @@ async def test_the_watchdog_recovers_on_its_own_only_when_updates_are_not_skippe
 
     assert client.polls > 0
     assert (client.recoveries == 0) is skip_updates
+    if not skip_updates:
+        assert client.recovery_ids and all(state_id == 0 for state_id in client.recovery_ids)
 
 
 @pytest.mark.parametrize("skip_updates", [True, False])
@@ -4449,8 +4765,8 @@ async def test_start_recovers_on_its_own_only_when_updates_are_not_skipped(skip_
     client.skip_updates = skip_updates
     recoveries = []
 
-    async def recover_gaps():
-        recoveries.append(1)
+    async def recover_gaps(ids=None):
+        recoveries.append(ids)
         return (0, 0)
 
     client.recover_gaps = recover_gaps
@@ -6428,7 +6744,12 @@ async def test_a_rich_media_block_sends_an_http_url_as_external_media(block_type
 
 class _TooLongClient:
     handle_updates = pyrogram.Client.handle_updates
+    _handle_update_container = pyrogram.Client._handle_update_container
     _save_update_state = pyrogram.Client._save_update_state
+    _load_update_mark = pyrogram.Client._load_update_mark
+    _peer_recovery_lock = pyrogram.Client._peer_recovery_lock
+    _enqueue_ordered_update = pyrogram.Client._enqueue_ordered_update
+    _accept_update_sequence = pyrogram.Client._accept_update_sequence
     _recover_too_long = pyrogram.Client._recover_too_long
     _recover_too_long_state = pyrogram.Client._recover_too_long_state
 
@@ -6491,7 +6812,7 @@ async def test_a_channel_too_long_update_recovers_from_the_state_seen_in_this_ru
     await _settle()
 
     assert client.recovered == [-1000000000005]
-    assert client.states == []
+    assert client.states == [(0, None, None, 1700000000, 4)]
     assert client._recovering == set()
 
 
@@ -6501,9 +6822,9 @@ async def test_a_channel_too_long_update_for_a_channel_not_seen_in_this_run_only
     await client.handle_updates(_too_long_batch(raw.types.UpdateChannelTooLong(channel_id=5, pts=30)))
     await _settle()
 
-    assert client.recovered == []
-    assert client.states == [(-1000000000005, 30, None, None, None)]
-    assert client._state_marks[-1000000000005] == (30, None)
+    assert client.recovered == [-1000000000005]
+    assert client.states == [(0, None, None, 1700000000, 4)]
+    assert client._state_marks[-1000000000005] == (10, None)
 
 
 async def test_a_channel_too_long_update_behind_the_known_pts_is_ignored():
