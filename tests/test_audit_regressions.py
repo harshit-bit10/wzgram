@@ -59,10 +59,7 @@ async def test_start_recovers_global_updates_before_saved_peers():
 
     await Dispatcher(client).start()
 
-    assert [call.args for call in client.recover_gaps.await_args_list] == [
-        (0,),
-        ([-1000000000001, -1000000000002],),
-    ]
+    assert [call.kwargs for call in client.recover_gaps.await_args_list] == [{"ids": 0}]
 
 
 async def test_a_dispatcher_cycle_does_not_grow_its_lock_list():
@@ -4124,6 +4121,9 @@ class _GapClient:
 
         return raw.types.InputChannel(channel_id=1, access_hash=0)
 
+    async def fetch_peers(self, peers):
+        return False
+
     async def invoke(self, query, **kwargs):
         self.sent.append(query)
 
@@ -4549,6 +4549,19 @@ async def test_channel_pts_gap_is_recovered_before_the_update_is_enqueued():
     assert client.recover_calls == [channel_key]
     assert client.enqueued == [update]
     assert client.states[channel_key][1] == 13
+
+
+async def test_channel_too_long_triggers_recovery_even_if_global_seq_has_a_gap():
+    from pyrogram import raw
+
+    update = raw.types.UpdateChannelTooLong(channel_id=5, pts=30)
+    client = _UpdateOrderClient([(0, 5, 1, 1700000000, 2)])
+
+    await client.handle_updates(raw.types.UpdatesCombined(
+        updates=[update], users=[], chats=[], date=1700000001, seq_start=4, seq=4
+    ))
+
+    assert client.scheduled == [(utils.get_channel_id(5), 30)]
 
 
 async def test_channel_pts_gap_that_cannot_be_recovered_is_not_advanced():
@@ -6816,6 +6829,16 @@ async def test_a_channel_too_long_update_recovers_from_the_state_seen_in_this_ru
     assert client._recovering == set()
 
 
+async def test_a_channel_too_long_without_saved_state_recovers_from_event_pts():
+    client = _TooLongClient()
+
+    await client.handle_updates(_too_long_batch(raw.types.UpdateChannelTooLong(channel_id=5, pts=30)))
+    await _settle()
+
+    assert client.states[-1] == (-1000000000005, 30, None, None, None)
+    assert client.recovered == [-1000000000005]
+
+
 async def test_a_channel_too_long_update_for_a_channel_not_seen_in_this_run_only_records_its_pts():
     client = _TooLongClient(states=[(-1000000000005, 10, None, None, None)])
 
@@ -7075,3 +7098,124 @@ async def test_anchor_links_are_resolved_against_the_anchors_of_the_whole_messag
     assert links[1].reference_name == "ref"
     assert links[2].url == "#missing"
     assert links[3].anchor_name == "a b"
+
+
+async def test_channel_recovery_uses_channel_message_updates():
+    from pyrogram import raw
+
+    client = _GapClient([(-1000000000001, 100, None, 7, 1)], [
+        raw.types.updates.ChannelDifference(
+            final=True, pts=200, new_messages=[_channel_message(21)],
+            other_updates=[], chats=[], users=[],
+        ),
+    ])
+
+    await client.recover_gaps()
+
+    assert isinstance(client.enqueued[0], raw.types.UpdateNewChannelMessage)
+
+
+async def test_channel_difference_too_long_does_not_emit_latest_messages_as_new():
+    from types import SimpleNamespace
+    from pyrogram import raw
+
+    client = _GapClient([(-1000000000001, 100, None, 7, 1)], [
+        raw.types.updates.ChannelDifferenceTooLong(
+            dialog=SimpleNamespace(pts=200), messages=[_channel_message(22)],
+            chats=[], users=[], final=True,
+        ),
+        raw.types.updates.ChannelDifference(
+            final=True, pts=200, new_messages=[], other_updates=[], chats=[], users=[],
+        ),
+    ])
+
+    await client.recover_gaps()
+
+    assert client.enqueued == []
+    assert [query.pts for query in client.sent] == [100, 200]
+    assert client.written[-1][1] == 200
+
+
+async def test_channel_difference_too_long_without_pts_keeps_the_saved_cursor():
+    from types import SimpleNamespace
+    from pyrogram import raw
+
+    client = _GapClient([(-1000000000001, 100, None, 7, 1)], [
+        raw.types.updates.ChannelDifferenceTooLong(
+            dialog=SimpleNamespace(), messages=[], chats=[], users=[], final=True,
+        ),
+    ])
+
+    await client.recover_gaps()
+
+    assert len(client.sent) == 1
+    assert client.written == []
+
+
+async def test_short_update_recovery_uses_saved_qts():
+    from pyrogram import raw
+
+    client = _QtsClient()
+    client.states.append((0, 10, 50, 7, 1))
+    sent = []
+
+    async def invoke(query, **kwargs):
+        sent.append(query)
+        return raw.types.updates.DifferenceEmpty(date=8, seq=2)
+
+    client.invoke = invoke
+    await client.handle_updates(raw.types.UpdateShortMessage(
+        id=12, user_id=1, message="m", pts=12, pts_count=1, date=8,
+    ))
+
+    assert sent[0].qts == 50
+
+
+def test_rate_limiter_classifies_upload_parts_and_typing_correctly():
+    from types import SimpleNamespace
+    from pyrogram.methods.advanced.invoke import Invoke
+    from pyrogram.methods.rate_limiter import RateLimiter
+
+    classify = Invoke()._classify_query
+
+    assert classify(SimpleNamespace(QUALNAME="upload.SaveFilePart")) == RateLimiter.CATEGORY_MEDIA
+    assert classify(SimpleNamespace(QUALNAME="upload.SaveBigFilePart")) == RateLimiter.CATEGORY_MEDIA
+    assert classify(SimpleNamespace(QUALNAME="messages.SetTyping")) == RateLimiter.CATEGORY_QUERY
+    assert classify(SimpleNamespace(QUALNAME="messages.DeleteMessages")) == RateLimiter.CATEGORY_BULK
+
+
+
+def test_encrypted_difference_updates_preserve_qts_order():
+    from types import SimpleNamespace
+    from pyrogram import raw
+    from pyrogram.methods.advanced.update_helpers import (
+        encrypted_updates, ordered_difference_updates,
+    )
+
+    encrypted = SimpleNamespace(random_id=7)
+    bot_update = raw.types.UpdateBotStopped(
+        user_id=1, date=0, stopped=True, qts=11,
+    )
+    plain_update = raw.types.UpdateUserStatus(
+        user_id=1, status=raw.types.UserStatusOnline(expires=1700000010),
+    )
+    diff = SimpleNamespace(
+        new_encrypted_messages=[encrypted], other_updates=[plain_update, bot_update],
+    )
+
+    mapped = encrypted_updates(diff, 10, 12)
+
+    assert mapped is not None
+    assert [update.qts for update in ordered_difference_updates(
+        diff.other_updates, mapped
+    ) if getattr(update, "qts", None) is not None] == [11, 12]
+    assert ordered_difference_updates(diff.other_updates, mapped)[-1] is plain_update
+
+
+def test_encrypted_difference_with_unmatched_qts_keeps_state_unchanged():
+    from types import SimpleNamespace
+    from pyrogram.methods.advanced.update_helpers import encrypted_updates
+
+    diff = SimpleNamespace(new_encrypted_messages=[SimpleNamespace(random_id=7)], other_updates=[])
+
+    assert encrypted_updates(diff, 10, 13) is None
