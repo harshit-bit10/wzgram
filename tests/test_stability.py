@@ -654,18 +654,19 @@ async def test_a_full_queue_waits_for_room_instead_of_raising(monkeypatch):
     assert await asyncio.wait_for(pending, timeout=2) is True
 
 
-async def test_a_permanently_full_queue_drops_and_says_so(monkeypatch, caplog):
+async def test_a_full_queue_does_not_drop_updates_after_the_old_timeout(monkeypatch):
     dispatcher = make_dispatcher()
     monkeypatch.setattr(Dispatcher, "ENQUEUE_TIMEOUT", 0.05)
 
     for _ in range(dispatcher.updates_queue.maxsize):
         dispatcher.updates_queue.put_nowait(("filler", {}, {}))
 
-    with caplog.at_level("WARNING"):
-        queued = await dispatcher.enqueue_update("late", {}, {})
+    queued = asyncio.create_task(dispatcher.enqueue_update("late", {}, {}))
+    await asyncio.sleep(0.1)
 
-    assert queued is False
-    assert "Dropping" in caplog.text, "a dropped update must not be silent"
+    assert not queued.done()
+    dispatcher.updates_queue.get_nowait()
+    assert await asyncio.wait_for(queued, timeout=2) is True
 
 
 async def test_the_updates_queue_stays_bounded():
@@ -676,7 +677,7 @@ async def test_the_updates_queue_stays_bounded():
     )
 
 
-async def test_update_batches_waiting_for_handlers_are_capped(monkeypatch, caplog):
+async def test_update_backlog_does_not_block_packet_handling(monkeypatch):
     class BlockedClient(DummyClient):
         def __init__(self):
             super().__init__()
@@ -686,38 +687,32 @@ async def test_update_batches_waiting_for_handlers_are_capped(monkeypatch, caplo
             await self.gate.wait()
             self.updates.append(body)
 
+    monkeypatch.setattr(Session, "MAX_PENDING_UPDATES", 40)
     client = BlockedClient()
     session = make_session(client)
     session.connection = RecordingConnection()
-    monkeypatch.setattr(Session, "MAX_PENDING_UPDATES", 40)
 
     body = raw.types.UpdatesTooLong().write()
     base = MsgId() | 1
 
-    with caplog.at_level("WARNING"):
+    async def send_all():
         for i in range(100):
             monkeypatch.setattr(
                 session_mod.warpcrypto, "unpack_message", unpacked_as(base + 4 * i, body)
             )
             await session.handle_packet(b"ignored")
 
-        assert session._pending_updates == 40, (
-            "update batches must stop piling up once handlers fall behind"
-        )
-        assert session._dropped_updates == 60
-        assert caplog.text.count("Dropping") == 1, "one warning per overload, not one per batch"
+    await asyncio.wait_for(send_all(), timeout=5)
+    assert session._pending_updates == 100
 
-        client.gate.set()
+    client.gate.set()
+    for _ in range(100):
+        if session._pending_updates == 0:
+            break
+        await asyncio.sleep(0.01)
 
-        for _ in range(100):
-            if session._pending_updates == 0:
-                break
-            await asyncio.sleep(0.01)
-
-    assert len(client.updates) == 40
+    assert len(client.updates) == 100
     assert session._pending_updates == 0
-    assert session._dropped_updates == 0
-    assert "Dropped 60 update batches" in caplog.text
 
 
 class FakeSession:
@@ -2250,6 +2245,7 @@ class _UnresolvableGapClient(RecoverGaps):
 
     def __init__(self):
         self._state_marks = {}
+        self._peer_recovery_locks = {}
         self.skip_updates = False
         self.recovered = []
         self.dropped = []
