@@ -139,7 +139,6 @@ class Session:
         self._packet_semaphore = asyncio.Semaphore(Session.MAX_INFLIGHT_PACKETS)
         self._update_semaphore = asyncio.Semaphore(32)
         self._pending_updates = 0
-        self._dropped_updates = 0
         self._invoke_semaphore = (
             asyncio.Semaphore(Session.MAX_INFLIGHT_MEDIA) if is_media else None
         )
@@ -313,7 +312,7 @@ class Session:
         if self is self.client.session and callable(self.client.connect_handler):
             try:
                 await self.client.connect_handler(self.client, self)
-            except BaseException as e:
+            except Exception as e:
                 log.exception(e)
 
     async def stop(self):
@@ -359,7 +358,7 @@ class Session:
         if self is self.client.session and callable(self.client.disconnect_handler):
             try:
                 await self.client.disconnect_handler(self.client)
-            except BaseException as e:
+            except Exception as e:
                 log.exception(e)
 
         log.info("Session stopped")
@@ -553,7 +552,7 @@ class Session:
                 msg_id = msg.body.msg_id
             else:
                 if self.client is not None:
-                    self._schedule_update(msg.body)
+                    await self._schedule_update(msg.body)
 
             if msg_id in self.results:
                 self.results[msg_id].value = getattr(msg.body, "result", msg.body)
@@ -615,30 +614,15 @@ class Session:
 
         await self.send(raw.types.MsgsAck(msg_ids=ack_ids), False)
 
-    def _schedule_update(self, body):
-        if self._pending_updates >= Session.MAX_PENDING_UPDATES:
-            self._dropped_updates += 1
-
-            if self._dropped_updates == 1:
-                log.warning(
-                    "Dropping %s: %s update batches are already waiting for handlers, "
-                    "handlers cannot keep up with the update rate. Consider raising "
-                    "`workers` or moving slow work off the handler.",
-                    type(body).__name__, self._pending_updates
-                )
-
-            return
-
+    async def _schedule_update(self, body):
         task = utils.run_in_background(self._run_update(body), self.loop)
         self._pending_updates += 1
+        if self._pending_updates == Session.MAX_PENDING_UPDATES + 1:
+            log.warning("Session has more than %s pending updates", Session.MAX_PENDING_UPDATES)
         task.add_done_callback(self._update_done)
 
     def _update_done(self, _task):
         self._pending_updates -= 1
-
-        if self._dropped_updates and self._pending_updates <= Session.MAX_PENDING_UPDATES // 2:
-            log.warning("Dropped %s update batches while handlers were busy", self._dropped_updates)
-            self._dropped_updates = 0
 
     async def _run_update(self, body):
         async with self._update_semaphore:
@@ -862,6 +846,11 @@ class Session:
             try:
                 return await self.send(query, timeout=timeout)
             except (FloodWait, FloodPremiumWait) as e:
+                rl = getattr(self.client, "rate_limiter", None)
+                classify = getattr(self.client, "_classify_query", None)
+                if rl is not None and not rl.is_closed and callable(classify):
+                    rl.on_flood(classify(query))
+
                 amount = e.value
 
                 if amount > sleep_threshold >= 0:
