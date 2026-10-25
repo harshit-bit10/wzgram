@@ -16,11 +16,13 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
-from typing import Optional
+import asyncio
 import logging
+from typing import Optional
 
 import pyrogram
 from pyrogram import raw
+from pyrogram.errors import FloodWait, FloodPremiumWait
 from pyrogram.raw.core import TLObject
 from pyrogram.session import Session
 from pyrogram.methods.rate_limiter import RateLimiter
@@ -171,7 +173,14 @@ class Invoke:
                 return RateLimiter.CATEGORY_MEDIA
             return RateLimiter.CATEGORY_MESSAGE
 
-        if any(x in name for x in ("Delete", "Ban", "Kick", "Unban", "Promote", "EditAdmin", "EditBanned", "Toggle", "Set", "Pin", "Report", "Block")):
+        # DeleteMessages / DeleteHistory are high-volume bulk ops, not admin actions.
+        # Only structural permission changes count as ADMIN.
+        if any(x in name for x in ("Ban", "Kick", "Unban", "Promote", "EditAdmin", "EditBanned")):
+            return RateLimiter.CATEGORY_ADMIN
+
+        if any(x in name for x in ("Toggle", "Set", "Pin", "Report", "Block", "Delete")):
+            if any(x in name for x in ("Messages", "History", "Scheduled", "Reactions")):
+                return RateLimiter.CATEGORY_BULK
             return RateLimiter.CATEGORY_ADMIN
 
         if any(x in name for x in ("GetDifference", "GetState", "Ping", "HttpWait")):
@@ -288,25 +297,37 @@ class Invoke:
                 query=query
             )
 
-        if self.rate_limiter is not None and not self.rate_limiter.is_closed:
-            category = self._classify_query(query)
-            await self.rate_limiter.acquire(category)
+        rl = self.rate_limiter
+        category = None
 
-        r = await self.session.invoke(
-            query, retries, timeout,
-            (sleep_threshold
-             if sleep_threshold is not None
-             else self.sleep_threshold)
-        )
+        if rl is not None and not rl.is_closed:
+            category = self._classify_query(query)
+            await rl.acquire(category)
+
+        try:
+            r = await self.session.invoke(
+                query, retries, timeout,
+                (sleep_threshold if sleep_threshold is not None else self.sleep_threshold)
+            )
+        except (FloodWait, FloodPremiumWait):
+            if rl is not None and not rl.is_closed and category is not None:
+                b = rl._buckets.get(category)
+                if b is not None and hasattr(b, "on_flood"):
+                    b.on_flood()
+            raise
 
         try:
             await self.fetch_peers(getattr(r, "users", []))
-        except Exception:
+        except BaseException as e:
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
             log.exception("Failed to fetch peers from users")
 
         try:
             await self.fetch_peers(getattr(r, "chats", []))
-        except Exception:
+        except BaseException as e:
+            if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
             log.exception("Failed to fetch peers from chats")
 
         return r
