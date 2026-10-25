@@ -354,6 +354,8 @@ class Dispatcher:
         self.update_parsers = {key: value for key_tuple, value in self.update_parsers.items() for key in key_tuple}
 
     async def enqueue_update(self, update, users, chats) -> bool:
+        if self.client.no_updates:
+            return False
         await self.updates_queue.put((update, users, chats))
         return True
 
@@ -375,7 +377,11 @@ class Dispatcher:
             log.info("Started %s HandlerTasks", self.client.workers)
 
             if not self.client.skip_updates:
-                await self.client.recover_gaps()
+                await self.client.recover_gaps(ids=0)
+                states = await self.client.storage.update_state()
+                peer_ids = [state[0] for state in states or () if state[0] != 0]
+                if peer_ids:
+                    await self.client.recover_gaps(ids=peer_ids)
 
     def prune_workers(self):
         self.handler_worker_tasks = [
