@@ -1238,67 +1238,87 @@ class Client(Methods):
             for key, pts in too_long.items():
                 self._recover_too_long(key, pts)
         elif isinstance(updates, (raw.types.UpdateShortMessage, raw.types.UpdateShortChatMessage)):
-            # NOTE: state is saved AFTER GetDifference succeeds and the update is
-            # dispatched.  Saving it before the invoke means that if the request
-            # fails (flood wait, connection reset, server error) the pts pointer
-            # advances past a message that was never delivered and that message
-            # is silently lost on the next recover_gaps pass.
-            #
-            # On failure we log and leave pts where it was — recover_gaps picks
-            # the message up on the next pass.  No pts advance, no fake messages.
-            try:
-                diff = await self.invoke(
-                    raw.functions.updates.GetDifference(
-                        pts=updates.pts - updates.pts_count,
-                        date=updates.date,
-                        qts=-1
-                    )
-                )
-            except BaseException as e:
-                # Re-raise task-cancellation and interpreter shutdown — these
-                # are not recoverable RPC failures and must propagate normally.
-                # On Python 3.10 CancelledError is already a BaseException
-                # subclass, so this guard is correct on all supported versions.
-                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                log.warning(
-                    "GetDifference failed for %s (pts=%s); "
-                    "message will be re-delivered via recover_gaps",
-                    type(updates).__name__, updates.pts
-                )
-            else:
-                if diff.new_messages:
-                    await self.dispatcher.enqueue_update(
-                        raw.types.UpdateNewMessage(
-                            message=diff.new_messages[0],
-                            pts=updates.pts,
-                            pts_count=updates.pts_count
-                        ),
-                        {u.id: u for u in diff.users},
-                        {c.id: c for c in diff.chats}
-                    )
-                else:
-                    if diff.other_updates:  # The other_updates list can be empty
-                        await self.dispatcher.enqueue_update(diff.other_updates[0], {}, {})
+            lock = self._peer_recovery_locks.setdefault(0, asyncio.Lock())
+            async with lock:
+                if 0 not in self._state_marks:
+                    states = await self.storage.update_state()
+                    state = next((row for row in states or () if row[0] == 0), None)
+                    if state is not None:
+                        self._state_marks[0] = (state[1], state[2])
 
-                await self._save_update_state(
-                    (
-                        0,
-                        updates.pts,
-                        None,
-                        updates.date,
-                        None
-                    )
-                )
+                known_pts, known_qts = self._state_marks.get(0, (None, None))
+                if known_pts is not None and known_pts >= updates.pts:
+                    return
+
+                pts = known_pts if known_pts is not None else updates.pts - updates.pts_count
+                if known_pts is None:
+                    self._state_marks[0] = (pts, known_qts)
+                await self._handle_short_update(updates, pts)
         elif isinstance(updates, raw.types.UpdateShort):
-            await self.dispatcher.enqueue_update(updates.update, {}, {})
+            queued = await self.dispatcher.enqueue_update(updates.update, {}, {})
 
             qts = getattr(updates.update, "qts", None)
 
-            if qts:
+            if queued and qts:
                 await self._save_update_state((0, None, qts, updates.date, None))
         elif isinstance(updates, raw.types.UpdatesTooLong):
             self._recover_too_long(0, None)
+
+    async def _handle_short_update(self, update, pts):
+        date = update.date
+        qts = -1
+
+        try:
+            while True:
+                diff = await self.invoke(
+                    raw.functions.updates.GetDifference(pts=pts, date=date, qts=qts)
+                )
+                if isinstance(diff, raw.types.updates.DifferenceEmpty):
+                    await self._save_update_state((0, pts, None, diff.date, diff.seq))
+                    return
+
+                if isinstance(diff, raw.types.updates.DifferenceTooLong):
+                    await self._save_update_state((0, diff.pts, None, date, None))
+                    self._recover_too_long(0, None)
+                    return
+
+                if isinstance(diff, raw.types.updates.DifferenceSlice):
+                    state = diff.intermediate_state
+                    complete = False
+                elif isinstance(diff, raw.types.updates.Difference):
+                    state = diff.state
+                    complete = True
+                else:
+                    log.warning("Unexpected GetDifference response: %s", type(diff).__name__)
+                    return
+
+                users = {u.id: u for u in diff.users}
+                chats = {c.id: c for c in diff.chats}
+
+                for message in diff.new_messages:
+                    if not await self.dispatcher.enqueue_update(
+                        raw.types.UpdateNewMessage(message=message, pts=state.pts, pts_count=-1),
+                        users,
+                        chats,
+                    ):
+                        log.warning("Update queue rejected a recovered message; keeping the old pts")
+                        return
+
+                for item in diff.other_updates:
+                    if not await self.dispatcher.enqueue_update(item, users, chats):
+                        log.warning("Update queue rejected a recovered update; keeping the old pts")
+                        return
+
+                await self._save_update_state((0, state.pts, state.qts, state.date, state.seq))
+                if complete:
+                    return
+
+                pts, qts, date = state.pts, state.qts, state.date
+        except Exception as e:
+            log.warning(
+                "GetDifference failed for %s (pts=%s): %s",
+                type(update).__name__, update.pts, str(e) or type(e).__name__
+            )
 
     def _recover_too_long(self, key, pts):
         if key in self._recovering:
@@ -2262,30 +2282,25 @@ class Client(Methods):
 
     @contextlib.asynccontextmanager
     async def _media_pool(self, dc_id: int, n: int):
-        # _media_pool_demand is a shared counter: guard every read-modify-write so
-        # that concurrent downloads for the same DC don't race on it and produce
-        # an incorrect pool size (under-provisioned or capped too early).
-        # _demand_added tracks whether the increment landed so that a
-        # CancelledError raised between the increment and the yield (e.g. during
-        # asyncio.ensure_future) does not trigger a decrement in finally, which
-        # would produce a negative counter and permanently under-provision this DC.
-        _demand_added = False
-        async with self._media_pool_demand_lock:
-            self._media_pool_demand[dc_id] = self._media_pool_demand.get(dc_id, 0) + n
-            _demand_added = True
-            target = min(self._media_pool_demand[dc_id], self.MEDIA_POOL_CAP)
-
-        task = asyncio.ensure_future(
-            self._get_media_session_pool(dc_id, target)
-        )
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
-
+        added = False
+        task = None
         try:
+            async with self._media_pool_demand_lock:
+                self._media_pool_demand[dc_id] = self._media_pool_demand.get(dc_id, 0) + n
+                added = True
+                target = min(self._media_pool_demand[dc_id], self.MEDIA_POOL_CAP)
+
+            task = asyncio.ensure_future(self._get_media_session_pool(dc_id, target))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
             yield task
         finally:
-            if _demand_added:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            if added:
                 async with self._media_pool_demand_lock:
-                    remaining = self._media_pool_demand.get(dc_id, n) - n
+                    remaining = self._media_pool_demand.get(dc_id, 0) - n
 
                     if remaining > 0:
                         self._media_pool_demand[dc_id] = remaining
