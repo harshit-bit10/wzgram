@@ -634,6 +634,12 @@ class Client(Methods):
         self._last_update_monotonic = time.monotonic()
         self._state_marks = {}
         self._recovering = set()
+        # Per-peer asyncio.Lock so concurrent callers (public recover_gaps() and
+        # internal _recover_too_long_state()) queue up rather than race on pts.
+        # WeakValueDictionary: once no coroutine holds a reference to the lock
+        # the entry is collected automatically, so the dict never leaks for
+        # accounts with thousands of channels.
+        self._peer_recovery_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
 
         self.media_pool_reaper_task = None
         self.media_pool_reaper_event = asyncio.Event()
@@ -1237,37 +1243,53 @@ class Client(Methods):
             # fails (flood wait, connection reset, server error) the pts pointer
             # advances past a message that was never delivered and that message
             # is silently lost on the next recover_gaps pass.
-            diff = await self.invoke(
-                raw.functions.updates.GetDifference(
-                    pts=updates.pts - updates.pts_count,
-                    date=updates.date,
-                    qts=-1
+            #
+            # On failure we log and leave pts where it was — recover_gaps picks
+            # the message up on the next pass.  No pts advance, no fake messages.
+            try:
+                diff = await self.invoke(
+                    raw.functions.updates.GetDifference(
+                        pts=updates.pts - updates.pts_count,
+                        date=updates.date,
+                        qts=-1
+                    )
                 )
-            )
-
-            if diff.new_messages:
-                await self.dispatcher.enqueue_update(
-                    raw.types.UpdateNewMessage(
-                        message=diff.new_messages[0],
-                        pts=updates.pts,
-                        pts_count=updates.pts_count
-                    ),
-                    {u.id: u for u in diff.users},
-                    {c.id: c for c in diff.chats}
+            except BaseException as e:
+                # Re-raise task-cancellation and interpreter shutdown — these
+                # are not recoverable RPC failures and must propagate normally.
+                # On Python 3.10 CancelledError is already a BaseException
+                # subclass, so this guard is correct on all supported versions.
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                log.warning(
+                    "GetDifference failed for %s (pts=%s); "
+                    "message will be re-delivered via recover_gaps",
+                    type(updates).__name__, updates.pts
                 )
             else:
-                if diff.other_updates:  # The other_updates list can be empty
-                    await self.dispatcher.enqueue_update(diff.other_updates[0], {}, {})
+                if diff.new_messages:
+                    await self.dispatcher.enqueue_update(
+                        raw.types.UpdateNewMessage(
+                            message=diff.new_messages[0],
+                            pts=updates.pts,
+                            pts_count=updates.pts_count
+                        ),
+                        {u.id: u for u in diff.users},
+                        {c.id: c for c in diff.chats}
+                    )
+                else:
+                    if diff.other_updates:  # The other_updates list can be empty
+                        await self.dispatcher.enqueue_update(diff.other_updates[0], {}, {})
 
-            await self._save_update_state(
-                (
-                    0,
-                    updates.pts,
-                    None,
-                    updates.date,
-                    None
+                await self._save_update_state(
+                    (
+                        0,
+                        updates.pts,
+                        None,
+                        updates.date,
+                        None
+                    )
                 )
-            )
         elif isinstance(updates, raw.types.UpdateShort):
             await self.dispatcher.enqueue_update(updates.update, {}, {})
 
@@ -1291,6 +1313,10 @@ class Client(Methods):
         utils.run_in_background(self._recover_too_long_state(key, pts), self.loop)
 
     async def _recover_too_long_state(self, key, pts):
+        # recover_gaps() acquires the per-peer lock internally, so concurrent
+        # calls for the same peer — whether from _recover_too_long or from the
+        # public API — will queue up rather than issuing parallel GetDifference
+        # calls that race on the pts pointer.
         try:
             if key in self._state_marks:
                 await self.recover_gaps(key)
@@ -2239,8 +2265,14 @@ class Client(Methods):
         # _media_pool_demand is a shared counter: guard every read-modify-write so
         # that concurrent downloads for the same DC don't race on it and produce
         # an incorrect pool size (under-provisioned or capped too early).
+        # _demand_added tracks whether the increment landed so that a
+        # CancelledError raised between the increment and the yield (e.g. during
+        # asyncio.ensure_future) does not trigger a decrement in finally, which
+        # would produce a negative counter and permanently under-provision this DC.
+        _demand_added = False
         async with self._media_pool_demand_lock:
             self._media_pool_demand[dc_id] = self._media_pool_demand.get(dc_id, 0) + n
+            _demand_added = True
             target = min(self._media_pool_demand[dc_id], self.MEDIA_POOL_CAP)
 
         task = asyncio.ensure_future(
@@ -2251,13 +2283,14 @@ class Client(Methods):
         try:
             yield task
         finally:
-            async with self._media_pool_demand_lock:
-                remaining = self._media_pool_demand.get(dc_id, n) - n
+            if _demand_added:
+                async with self._media_pool_demand_lock:
+                    remaining = self._media_pool_demand.get(dc_id, n) - n
 
-                if remaining > 0:
-                    self._media_pool_demand[dc_id] = remaining
-                else:
-                    self._media_pool_demand.pop(dc_id, None)
+                    if remaining > 0:
+                        self._media_pool_demand[dc_id] = remaining
+                    else:
+                        self._media_pool_demand.pop(dc_id, None)
 
     async def _get_media_session_pool(self, dc_id: int, n: int) -> list:
         lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())

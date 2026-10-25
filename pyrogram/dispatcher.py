@@ -22,7 +22,7 @@ import inspect
 import logging
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import pyrogram
 from pyrogram import utils
@@ -427,7 +427,12 @@ class Dispatcher:
                         )
                         break
 
-            for i in [*self.handler_worker_tasks, *self.relief_workers]:
+            # Snapshot both sets before awaiting: a relief worker finishing
+            # mid-iteration would mutate relief_workers (via its done callback)
+            # and cause a RuntimeError on the set iterator.
+            all_workers = [*self.handler_worker_tasks, *list(self.relief_workers)]
+
+            for i in all_workers:
                 try:
                     await asyncio.wait_for(i, timeout=10)
                 except asyncio.TimeoutError:
@@ -437,7 +442,9 @@ class Dispatcher:
                         await i
                     except asyncio.CancelledError:
                         pass
-                except Exception:
+                except BaseException as e:
+                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise
                     pass
 
             # a sentinel a cancelled worker never took retires a worker of the
@@ -658,7 +665,9 @@ class Dispatcher:
                         break
             except pyrogram.StopPropagation:
                 pass
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
                 log.exception(e)
 
     async def handle_update_handler_exception(
@@ -666,8 +675,8 @@ class Dispatcher:
         exc: Exception,
         update_handler: Handler,
         update: "pyrogram.raw.base.Update",
-        users: Dict[int, "pyrogram.raw.base.User"],
-        chats: Dict[int, "pyrogram.raw.base.Chat"],
+        users: dict[int, "pyrogram.raw.base.User"],
+        chats: dict[int, "pyrogram.raw.base.Chat"],
         parsed_update: Optional["pyrogram.types.Update"] = None
     ) -> None:
         handled = False
