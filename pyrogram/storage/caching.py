@@ -27,6 +27,7 @@ from .. import utils
 
 PEER_CACHE_SIZE = int(os.environ.get("WZGRAM_PEER_CACHE", 4096))
 PEER_WRITE_TTL = 60 * 60
+PEER_CACHE_TTL = float(os.environ.get("WZGRAM_PEER_CACHE_TTL", 900))
 
 
 def get_input_peer(peer_id: int, access_hash: int, peer_type: str) -> "raw.base.InputPeer":
@@ -59,10 +60,19 @@ class PeerRowCache:
     costs, or a network round trip on a remote engine.
     """
 
-    def __init__(self, size: int = PEER_CACHE_SIZE, write_ttl: float = PEER_WRITE_TTL):
+    def __init__(
+        self,
+        size: int = PEER_CACHE_SIZE,
+        write_ttl: float = PEER_WRITE_TTL,
+        cache_ttl: float = PEER_CACHE_TTL,
+    ):
         self.size = size
         self.write_ttl = write_ttl
-        self._rows: "OrderedDict[int, Tuple[Tuple[int, int, str], Optional[str], Optional[float]]]" = OrderedDict()
+        self.cache_ttl = cache_ttl
+        self._rows: "OrderedDict[int, Tuple[Tuple[int, int, str], Optional[str], Optional[float], float]]" = OrderedDict()
+
+    def _expired(self, entry, now: float) -> bool:
+        return self.cache_ttl > 0 and now - entry[3] > self.cache_ttl
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -73,8 +83,11 @@ class PeerRowCache:
         if entry is None:
             return None
 
-        self._rows.move_to_end(peer_id)
+        if self._expired(entry, time.monotonic()):
+            self._rows.pop(peer_id, None)
+            return None
 
+        self._rows.move_to_end(peer_id)
         return entry[0]
 
     def matches(
@@ -89,9 +102,10 @@ class PeerRowCache:
         if entry is None:
             return False
 
-        row, phone, written_at = entry
+        row, phone, written_at, cached_at = entry
+        now = time.monotonic()
 
-        if written_at is None or time.monotonic() - written_at > self.write_ttl:
+        if written_at is None or now - written_at > self.write_ttl:
             return False
 
         if row != (peer_id, access_hash, peer_type) or phone != phone_number:
@@ -110,10 +124,12 @@ class PeerRowCache:
         rows = self._rows
 
         rows.pop(row[0], None)
+        now = time.monotonic()
         rows[row[0]] = (
             tuple(row),
             phone_number,
-            time.monotonic() if written else None
+            now if written else None,
+            now,
         )
 
         # remember() inserts exactly one entry, so at most one eviction is
