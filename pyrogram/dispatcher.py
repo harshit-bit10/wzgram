@@ -354,28 +354,8 @@ class Dispatcher:
         self.update_parsers = {key: value for key_tuple, value in self.update_parsers.items() for key in key_tuple}
 
     async def enqueue_update(self, update, users, chats) -> bool:
-        """Hand an update to the workers, waiting for room. Returns False if dropped."""
-        try:
-            self.updates_queue.put_nowait((update, users, chats))
-            return True
-        except asyncio.QueueFull:
-            pass
-
-        try:
-            await asyncio.wait_for(
-                self.updates_queue.put((update, users, chats)),
-                self.ENQUEUE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            log.warning(
-                "Dropping %s update after %ss: handlers cannot keep up with the "
-                "update rate (queue size %s). Consider raising `workers` or "
-                "moving slow work off the handler.",
-                type(update).__name__, self.ENQUEUE_TIMEOUT, self.updates_queue.maxsize
-            )
-            return False
-        else:
-            return True
+        await self.updates_queue.put((update, users, chats))
+        return True
 
     async def start(self):
         if callable(self.client.start_handler):
