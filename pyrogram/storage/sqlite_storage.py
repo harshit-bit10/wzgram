@@ -240,11 +240,11 @@ class SQLiteStorage(Storage):
                 await asyncio.sleep(self._CHECKPOINT_SECONDS)
                 if self.conn is not None and not self._dirty:
                     try:
-                        await self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        await self.conn.execute_fetchall("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception:
-                        pass
+                        log.exception("WAL checkpoint failed")
         except asyncio.CancelledError:
-            pass
+            raise
 
     async def update(self):
         version = await self.version()
@@ -329,7 +329,6 @@ class SQLiteStorage(Storage):
         if self.use_wal:
             await self.conn.execute_fetchall("PRAGMA journal_mode=WAL")
             await self.conn.execute("PRAGMA synchronous=NORMAL")
-            self._checkpoint_task = asyncio.get_event_loop().create_task(self._checkpoint_loop())
         else:
             await self.conn.execute_fetchall("PRAGMA journal_mode=DELETE")
 
@@ -343,6 +342,8 @@ class SQLiteStorage(Storage):
 
         await self._load_cache()
         await self._ensure_committed()
+        if self.use_wal:
+            self._checkpoint_task = asyncio.get_running_loop().create_task(self._checkpoint_loop())
 
     async def _load_cache(self):
         row = await self._fetchone(
@@ -360,9 +361,12 @@ class SQLiteStorage(Storage):
         await self._ensure_committed()
 
     async def close(self):
-        for t in (self._flush_task, self._checkpoint_task):
-            if t is not None:
-                t.cancel()
+        tasks = [t for t in (self._flush_task, self._checkpoint_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
         self._flush_task = None
         self._checkpoint_task = None
 
@@ -379,13 +383,7 @@ class SQLiteStorage(Storage):
         self._cache.clear()
 
     async def delete(self):
-        if self.conn:
-            await self.conn.close()
-            self.conn = None
-
-        if self._lock_fd is not None:
-            _unlock(self._lock_fd)
-            self._lock_fd = None
+        await self.close()
 
         if not self.in_memory:
             path = Path(self.database)
