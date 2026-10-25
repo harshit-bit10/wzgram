@@ -155,6 +155,7 @@ class SQLiteStorage(Storage):
     FILE_EXTENSION = ".session"
     _AUTO_COMMIT_INTERVAL = 20
     _AUTO_COMMIT_SECONDS = 5
+    _CHECKPOINT_SECONDS = 300
     _PEER_CACHE_SIZE = PEER_CACHE_SIZE
 
     def __init__(
@@ -178,6 +179,7 @@ class SQLiteStorage(Storage):
         self._dirty: bool = False
         self._write_count: int = 0
         self._flush_task: Optional[asyncio.Task] = None
+        self._checkpoint_task: Optional[asyncio.Task] = None
         self._lock_fd: Optional[object] = None
 
         if self.in_memory:
@@ -231,6 +233,18 @@ class SQLiteStorage(Storage):
             raise
         except Exception:
             log.exception("Deferred session commit failed")
+
+    async def _checkpoint_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(self._CHECKPOINT_SECONDS)
+                if self.conn is not None and not self._dirty:
+                    try:
+                        await self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
 
     async def update(self):
         version = await self.version()
@@ -315,6 +329,7 @@ class SQLiteStorage(Storage):
         if self.use_wal:
             await self.conn.execute_fetchall("PRAGMA journal_mode=WAL")
             await self.conn.execute("PRAGMA synchronous=NORMAL")
+            self._checkpoint_task = asyncio.get_event_loop().create_task(self._checkpoint_loop())
         else:
             await self.conn.execute_fetchall("PRAGMA journal_mode=DELETE")
 
@@ -345,9 +360,11 @@ class SQLiteStorage(Storage):
         await self._ensure_committed()
 
     async def close(self):
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            self._flush_task = None
+        for t in (self._flush_task, self._checkpoint_task):
+            if t is not None:
+                t.cancel()
+        self._flush_task = None
+        self._checkpoint_task = None
 
         await self._ensure_committed()
 
