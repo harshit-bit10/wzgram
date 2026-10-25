@@ -47,6 +47,38 @@ MAX_BATCH = 4 * 1024 * 1024
 PACER_BURST = 16
 
 
+def _env_int(name: str, default: int, maximum: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    try:
+        value = int(value)
+    except ValueError:
+        log.warning("Invalid %s; using %s", name, default)
+        return default
+
+    return min(max(value, 1), maximum)
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    try:
+        value = float(value)
+    except ValueError:
+        log.warning("Invalid %s; using %s", name, default)
+        return default
+
+    if not math.isfinite(value):
+        log.warning("Invalid %s; using %s", name, default)
+        return default
+
+    return min(max(value, minimum), maximum)
+
+
 async def _stop_workers(queue: asyncio.Queue, workers: list) -> list:
     """Retire the upload workers and collect what they ended with.
 
@@ -136,6 +168,8 @@ class SaveFile:
                         budget.release()
 
             async def _send_part(session, data):
+                nonlocal _paced
+
                 for attempt in range(MAX_RETRIES):
                     try:
                         if not await session.invoke(
@@ -161,9 +195,10 @@ class SaveFile:
                         delay = min(2 ** attempt, 30)
                         err_str = str(e)
                         if isinstance(e, Flood):
-                            if isinstance(e.value, int):
-                                delay = min(e.value, 300)
+                            if isinstance(e.value, (int, float)):
+                                delay = max(0, e.value)
                             _pacer.on_flood()
+                            _paced = True
                         log.warning(
                             "Retrying upload part (attempt %d/%d): %s",
                             attempt + 1, MAX_RETRIES, err_str[:120],
@@ -211,14 +246,29 @@ class SaveFile:
             is_big = file_size > 10 * 1024 * 1024
             pool_cap = max(1, math.ceil((file_total_parts - file_part) / 2))
             if is_bot:
-                rate_limit = int(os.environ.get("WZGRAM_UPLOAD_RATE_BOT", 32))
-                pool_size = min(int(os.environ.get("WZGRAM_UPLOAD_POOL_BOT", 8)), POOL_SIZE, pool_cap)
+                profile = "BOT"
+                rate_limit = _env_int("WZGRAM_UPLOAD_RATE_BOT", 32, 1000)
+                pool_size = min(_env_int("WZGRAM_UPLOAD_POOL_BOT", 8, POOL_SIZE), POOL_SIZE, pool_cap)
             elif is_premium:
-                rate_limit = int(os.environ.get("WZGRAM_UPLOAD_RATE_PREMIUM", 300))
-                pool_size = min(int(os.environ.get("WZGRAM_UPLOAD_POOL_PREMIUM", 14)), POOL_SIZE, pool_cap)
+                profile = "PREMIUM"
+                rate_limit = _env_int("WZGRAM_UPLOAD_RATE_PREMIUM", 300, 1000)
+                pool_size = min(_env_int("WZGRAM_UPLOAD_POOL_PREMIUM", 14, POOL_SIZE), POOL_SIZE, pool_cap)
             else:
-                rate_limit = int(os.environ.get("WZGRAM_UPLOAD_RATE_USER", 32))
-                pool_size = min(int(os.environ.get("WZGRAM_UPLOAD_POOL_USER", 12)), POOL_SIZE, pool_cap)
+                profile = "USER"
+                rate_limit = _env_int("WZGRAM_UPLOAD_RATE_USER", 32, 1000)
+                pool_size = min(_env_int("WZGRAM_UPLOAD_POOL_USER", 12, POOL_SIZE), POOL_SIZE, pool_cap)
+
+            rate_ceiling = max(
+                rate_limit,
+                _env_int(
+                    f"WZGRAM_UPLOAD_MAX_RATE_{profile}",
+                    max(rate_limit, 300),
+                    1000,
+                ),
+            )
+            rate_step = _env_float(
+                f"WZGRAM_UPLOAD_RATE_STEP_{profile}", 1.0, 0.1, 50.0
+            )
 
             is_missing_part = file_id is not None
             file_id = file_id or self.rnd_id()
@@ -251,7 +301,7 @@ class SaveFile:
 
             next_batch_task = None
             _pacer = AdaptiveBucket(
-                rate=rate_limit, ceiling=max(rate_limit, 300), burst=PACER_BURST, step=1.0
+                rate=rate_limit, ceiling=rate_ceiling, burst=PACER_BURST, step=rate_step
             )
             _paced = is_bot or not is_premium
             _stalled_since = 0.0
