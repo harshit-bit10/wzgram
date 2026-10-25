@@ -1499,6 +1499,9 @@ class TestWritesReachTheBackend:
         await storage.update_state((1, 100, 0, 1600000000, 5))
         await drained(storage)
         assert 1 in backend.states
+        assert [tuple(row) for row in await storage.update_state()] == [
+            (1, 100, 0, 1600000000, 5)
+        ]
 
         await storage.update_state(1)
         await drained(storage)
