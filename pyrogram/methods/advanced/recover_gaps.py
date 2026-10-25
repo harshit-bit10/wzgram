@@ -22,8 +22,15 @@ from typing import Iterable, Optional, Tuple, Union
 
 import pyrogram
 from pyrogram import raw
-from pyrogram.errors import ChannelInvalid, ChannelPrivate, PeerIdInvalid, PersistentTimestampInvalid, PersistentTimestampOutdated
+from pyrogram.errors import (
+    ChannelInvalid,
+    ChannelPrivate,
+    PeerIdInvalid,
+    PersistentTimestampInvalid,
+    PersistentTimestampOutdated,
+)
 from pyrogram.utils import ZERO_CHANNEL_ID, get_channel_id
+from .update_helpers import encrypted_updates, ordered_difference_updates
 
 log = logging.getLogger(__name__)
 
@@ -154,7 +161,7 @@ class RecoverGaps:
                             channel=await self.resolve_peer(id),
                             filter=raw.types.ChannelMessagesFilterEmpty(),
                             pts=local_pts,
-                            limit=10000,
+                            limit=100,
                             force=False
                         ) if id < ZERO_CHANNEL_ID else
                         raw.functions.updates.GetDifference(
@@ -246,31 +253,51 @@ class RecoverGaps:
                         failed = True
                         break
 
+                    # These are the latest messages, not the missing updates
+                    # from the old PTS. Don't dispatch them as new messages.
                     if pts_from_dialog <= local_pts:
                         log.warning("ChannelDifferenceTooLong made no progress for %s", id)
                         failed = True
                         break
 
+                    log.warning(
+                        "Channel %s has an unrecoverable update gap; resuming at pts %s",
+                        id, pts_from_dialog,
+                    )
                     local_pts = pts_from_dialog
                     await self._save_update_state(
-                        (
-                            id,
-                            local_pts,
-                            local_qts,
-                            local_date,
-                            local_seq
-                        )
+                        (id, local_pts, local_qts, local_date, local_seq)
                     )
                     continue
                 elif isinstance(diff, raw.types.updates.ChannelDifference):
                     local_pts = diff.pts
 
+                encrypted = encrypted_updates(diff, request[1], local_qts)
+                if encrypted is None:
+                    log.warning(
+                        "Could not map encrypted-message QTS values for %s; keeping the old state",
+                        id,
+                    )
+                    failed = True
+                    break
+
                 users = {i.id: i for i in diff.users}
                 chats = {i.id: i for i in diff.chats}
+                fetch_peers = getattr(self, "fetch_peers", None)
+                if fetch_peers is not None:
+                    await fetch_peers(diff.users)
+                    await fetch_peers(diff.chats)
 
                 for message in diff.new_messages:
+                    cache = getattr(self, "message_cache", None)
+                    if id < ZERO_CHANNEL_ID and cache is not None and cache.get((id, message.id)) is not None:
+                        continue
+                    update_type = (
+                        raw.types.UpdateNewChannelMessage
+                        if id < ZERO_CHANNEL_ID else raw.types.UpdateNewMessage
+                    )
                     queued = await self.dispatcher.enqueue_update(
-                        raw.types.UpdateNewMessage(
+                        update_type(
                             message=message,
                             pts=local_pts,
                             pts_count=-1
@@ -283,7 +310,7 @@ class RecoverGaps:
                         return (message_updates_counter, other_updates_counter)
                     message_updates_counter += 1
 
-                for update in diff.other_updates:
+                for update in ordered_difference_updates(diff.other_updates, encrypted):
                     queued = await self.dispatcher.enqueue_update(update, users, chats)
                     if not queued:
                         log.warning("Update queue rejected a recovered update; keeping the old pts")
