@@ -116,9 +116,11 @@ class PeerRowCache:
             time.monotonic() if written else None
         )
 
+        # remember() inserts exactly one entry, so at most one eviction is
+        # needed.  A while-loop re-checking len() on each iteration is
+        # redundant and allocates a new int on every pass.
         if len(rows) > self.size:
-            while len(rows) > self.size:
-                rows.popitem(last=False)
+            rows.popitem(last=False)
 
     def forget(self, peer_id: int) -> None:
         self._rows.pop(peer_id, None)
