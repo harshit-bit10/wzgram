@@ -64,6 +64,7 @@ class FakeClient:
     def __init__(self, chunks):
         self.get_file_semaphore = asyncio.Semaphore(1)
         self._media_pool_demand = {}
+        self._media_pool_demand_lock = asyncio.Lock()
         self.me = SimpleNamespace(is_bot=True, is_premium=False)
         self.session = FakeSession(chunks)
 
