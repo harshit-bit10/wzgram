@@ -22,6 +22,22 @@ class Asyncio:
         await asyncio.sleep(0)
 
 
+def test_upload_env_values_are_bounded(monkeypatch):
+    from pyrogram.methods.advanced.save_file import _env_float, _env_int
+
+    monkeypatch.setenv("WZGRAM_TEST_UPLOAD_SETTING", "99999")
+    assert _env_int("WZGRAM_TEST_UPLOAD_SETTING", 10, 1000) == 1000
+
+    monkeypatch.setenv("WZGRAM_TEST_UPLOAD_SETTING", "not-a-number")
+    assert _env_int("WZGRAM_TEST_UPLOAD_SETTING", 10, 1000) == 10
+
+    monkeypatch.setenv("WZGRAM_TEST_UPLOAD_SETTING", "inf")
+    assert _env_float("WZGRAM_TEST_UPLOAD_SETTING", 1.0, 0.1, 50.0) == 1.0
+
+    monkeypatch.setenv("WZGRAM_TEST_UPLOAD_SETTING", "99")
+    assert _env_float("WZGRAM_TEST_UPLOAD_SETTING", 1.0, 0.1, 50.0) == 50.0
+
+
 async def upload(tmp_path, monkeypatch, fail, size=4 * CHUNK):
     path = tmp_path / "up.bin"
     path.write_bytes(b"\x01" * size)
@@ -52,6 +68,35 @@ async def upload(tmp_path, monkeypatch, fail, size=4 * CHUNK):
 
     result = await asyncio.wait_for(client.save_file(str(path)), timeout=30)
     return result, attempts, slept
+
+
+async def test_upload_pacer_can_be_tuned_from_env(tmp_path, monkeypatch):
+    settings = {}
+
+    class Pacer:
+        def __init__(self, rate, ceiling, burst, step):
+            settings.update(rate=rate, ceiling=ceiling, burst=burst, step=step)
+
+        async def acquire(self):
+            pass
+
+        def on_success(self):
+            pass
+
+        def on_flood(self):
+            pass
+
+    monkeypatch.setattr(save_file_mod, "AdaptiveBucket", Pacer)
+    monkeypatch.setenv("WZGRAM_UPLOAD_RATE_USER", "64")
+    monkeypatch.setenv("WZGRAM_UPLOAD_MAX_RATE_USER", "400")
+    monkeypatch.setenv("WZGRAM_UPLOAD_RATE_STEP_USER", "4")
+
+    result, _, _ = await upload(tmp_path, monkeypatch, lambda n: None)
+
+    assert result is not None
+    assert settings["rate"] == 64
+    assert settings["ceiling"] == 400
+    assert settings["step"] == 4
 
 
 async def test_a_part_the_server_refuses_fails_the_upload_at_once(tmp_path, monkeypatch):
@@ -90,6 +135,18 @@ async def test_a_flood_wait_sleeps_what_the_server_asked(tmp_path, monkeypatch):
 
     assert result is not None
     assert 42 in slept, f"slept {slept}; the server asked for 42 seconds"
+
+
+
+
+async def test_a_long_flood_wait_is_not_clamped(tmp_path, monkeypatch):
+    result, _, slept = await upload(
+        tmp_path, monkeypatch,
+        lambda n: FloodWait(value=350, rpc_name="upload.SaveFilePart") if n == 1 else None,
+    )
+
+    assert result is not None
+    assert 350 in slept, f"the server asked for 350 seconds, slept {slept}"
 
 
 async def test_a_503_storm_is_still_ridden_out(tmp_path, monkeypatch):
