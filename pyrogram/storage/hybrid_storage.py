@@ -27,7 +27,7 @@ from .. import utils
 from .caching import PEER_CACHE_SIZE
 from .remote_storage import SESSION_FIELDS
 from .sqlite_storage import SQLiteStorage
-from .storage import Storage
+from .storage import Storage, _UNSET
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +201,7 @@ class HybridStorage(Storage):
             if index != victim:
                 self._queue.put_nowait(item)
 
+            # Requeued items get a new unfinished count from put_nowait().
             self._queue.task_done()
 
         self._dropped += 1
@@ -365,8 +366,8 @@ class HybridStorage(Storage):
         await self.local.update_usernames(usernames)
         self._enqueue(USERNAME_WRITE, list(usernames))
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        if value is object:
+    async def update_state(self, value: Tuple[int, int, int, int, int] = _UNSET):
+        if value is _UNSET:
             return await self.local.update_state()
 
         await self.local.update_state(value)
@@ -422,7 +423,7 @@ class HybridStorage(Storage):
             return await self.backend.get_peer_by_phone_number(phone_number)
 
     async def _attr(self, attr: str, value: Any) -> Any:
-        if value is object:
+        if value is _UNSET:
             return await getattr(self.local, attr)()
 
         await getattr(self.local, attr)(value)
@@ -430,31 +431,31 @@ class HybridStorage(Storage):
 
         return value
 
-    async def dc_id(self, value: int = object):
+    async def dc_id(self, value: int = _UNSET):
         return await self._attr("dc_id", value)
 
-    async def server_address(self, value: str = object):
+    async def server_address(self, value: str = _UNSET):
         return await self._attr("server_address", value)
 
-    async def port(self, value: int = object):
+    async def port(self, value: int = _UNSET):
         return await self._attr("port", value)
 
-    async def api_id(self, value: int = object):
+    async def api_id(self, value: int = _UNSET):
         return await self._attr("api_id", value)
 
-    async def test_mode(self, value: bool = object):
+    async def test_mode(self, value: bool = _UNSET):
         return await self._attr("test_mode", value)
 
-    async def auth_key(self, value: bytes = object):
+    async def auth_key(self, value: bytes = _UNSET):
         return await self._attr("auth_key", value)
 
-    async def date(self, value: int = object):
+    async def date(self, value: int = _UNSET):
         return await self._attr("date", value)
 
-    async def user_id(self, value: int = object):
+    async def user_id(self, value: int = _UNSET):
         return await self._attr("user_id", value)
 
-    async def is_bot(self, value: bool = object):
+    async def is_bot(self, value: bool = _UNSET):
         return await self._attr("is_bot", value)
 
     @property
