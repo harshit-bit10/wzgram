@@ -669,6 +669,42 @@ async def test_a_full_queue_does_not_drop_updates_after_the_old_timeout(monkeypa
     assert await asyncio.wait_for(queued, timeout=2) is True
 
 
+async def test_stopping_unblocks_an_enqueue_waiting_on_a_full_queue():
+    dispatcher = make_dispatcher()
+
+    for _ in range(dispatcher.updates_queue.maxsize):
+        dispatcher.updates_queue.put_nowait(("filler", {}, {}))
+
+    pending = asyncio.create_task(dispatcher.enqueue_update("late", {}, {}))
+    await asyncio.sleep(0)
+    assert not pending.done()
+
+    dispatcher._stopping = True
+    dispatcher._stop_event.set()
+
+    assert await asyncio.wait_for(pending, timeout=1) is False
+    assert dispatcher.updates_queue.qsize() == dispatcher.updates_queue.maxsize
+    assert not dispatcher.updates_queue._putters
+
+
+async def test_cancelling_a_full_queue_enqueue_cleans_up_waiters():
+    dispatcher = make_dispatcher()
+
+    for _ in range(dispatcher.updates_queue.maxsize):
+        dispatcher.updates_queue.put_nowait(("filler", {}, {}))
+
+    pending = asyncio.create_task(dispatcher.enqueue_update("late", {}, {}))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert dispatcher.updates_queue._putters
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert not dispatcher.updates_queue._putters
+
+
 async def test_the_updates_queue_stays_bounded():
     dispatcher = make_dispatcher()
 
