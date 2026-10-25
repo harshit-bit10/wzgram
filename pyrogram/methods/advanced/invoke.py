@@ -168,6 +168,12 @@ class Invoke:
         name = inner.QUALNAME if hasattr(inner, "QUALNAME") else type(inner).__name__
         short = name.split(".")[-1] if "." in name else name
 
+        if short == "SetTyping" or short == "SendScreenshotNotification":
+            return RateLimiter.CATEGORY_QUERY
+
+        if short in ("SaveFilePart", "SaveBigFilePart"):
+            return RateLimiter.CATEGORY_MEDIA
+
         if any(x in name for x in ("Ban", "Kick", "Unban", "Promote", "EditAdmin", "EditBanned")):
             return RateLimiter.CATEGORY_ADMIN
 
