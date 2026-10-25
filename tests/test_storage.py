@@ -24,7 +24,7 @@ from pyrogram.storage import (
     RedisStorage,
 )
 from pyrogram.storage.caching import PeerRowCache, SessionAttrCache
-from pyrogram.storage.hybrid_storage import PEER_WRITE, SESSION_WRITE
+from pyrogram.storage.hybrid_storage import PEER_WRITE, SESSION_WRITE, USERNAME_WRITE
 from pyrogram.storage.memory_storage import MemoryStorage
 from pyrogram.storage.sqlite_storage import PROD
 from pyrogram.storage.storage import WZ_PREFIX
@@ -1574,6 +1574,29 @@ class TestBackendFailures:
 
 
 class TestBackpressure:
+    async def test_make_room_keeps_queue_join_accounting_balanced(self, tmp_path):
+        storage = HybridStorage(
+            "accounting", backend=FakeRemote("accounting"), workdir=tmp_path, queue_size=3
+        )
+        storage._queue.put_nowait((PEER_WRITE, []))
+        storage._queue.put_nowait((SESSION_WRITE, {}))
+        storage._queue.put_nowait((USERNAME_WRITE, []))
+
+        storage._make_room()
+
+        assert storage._queue.qsize() == 2
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(storage._queue.join(), timeout=0.01)
+
+        while True:
+            try:
+                storage._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            storage._queue.task_done()
+
+        await asyncio.wait_for(storage._queue.join(), timeout=0.1)
+
     async def test_queue_is_bounded(self, tmp_path):
         backend = FakeRemote("bounded")
         storage = HybridStorage("bounded", backend=backend, workdir=tmp_path, queue_size=4)
