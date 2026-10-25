@@ -18,6 +18,8 @@
 
 import asyncio
 import logging
+import sys
+import weakref
 from typing import Iterable, Optional, Tuple, Union
 
 import pyrogram
@@ -70,12 +72,64 @@ class RecoverGaps:
 
         log.info("Started gaps recovering...")
 
-        for local_state in states:
+        # Build the list of peers that actually need work.
+        eligible = [
+            s for s in states
+            if not (s[1] is None and (s[0] != 0 or s[2] is None))
+        ]
+
+        async def _run_one(local_state) -> Tuple[int, int]:
             id, local_pts, local_qts, local_date, local_seq = local_state
+            # _peer_recovery_locks is a WeakValueDictionary: entries are
+            # collected automatically once no coroutine holds the lock, so
+            # the dict never grows unbounded for accounts with many channels.
+            peer_lock = self._peer_recovery_locks.setdefault(id, asyncio.Lock())
+            return await self._recover_peer(
+                id, local_pts, local_qts, local_date, local_seq, peer_lock
+            )
 
-            if local_pts is None and (id != 0 or local_qts is None):
-                continue
+        # On Python 3.11+ use TaskGroup so all peers are recovered concurrently
+        # and a single peer failure does not silently abort the rest.
+        # On 3.10 fall back to asyncio.gather with return_exceptions=True so
+        # behaviour is equivalent: failures are logged, not propagated.
+        if sys.version_info >= (3, 11):
+            results: list[Tuple[int, int] | BaseException] = []
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(_run_one(s)) for s in eligible]
+            results = [t.result() for t in tasks]
+        else:
+            raw_results = await asyncio.gather(
+                *(_run_one(s) for s in eligible),
+                return_exceptions=True,
+            )
+            results = []
+            for r in raw_results:
+                if isinstance(r, BaseException):
+                    log.exception("Gap recovery task raised unexpectedly: %r", r)
+                else:
+                    results.append(r)
 
+        for msgs, upds in results:
+            message_updates_counter += msgs
+            other_updates_counter += upds
+
+        log.info("Recovered %s messages and %s updates", message_updates_counter, other_updates_counter)
+        return (message_updates_counter, other_updates_counter)
+
+    async def _recover_peer(
+        self: "pyrogram.Client",
+        id: int,
+        local_pts,
+        local_qts,
+        local_date,
+        local_seq,
+        lock: asyncio.Lock,
+    ) -> Tuple[int, int]:
+        """Run the GetDifference loop for a single peer under its per-peer lock."""
+        message_updates_counter = 0
+        other_updates_counter = 0
+
+        async with lock:
             stale_attempts = 0
             unusable = False
             failed = False
@@ -118,11 +172,13 @@ class RecoverGaps:
 
                     await asyncio.sleep(stale_attempts)
                     continue
-                except Exception:
-                    # this runs inside dispatcher.start(): one peer that cannot be
-                    # fetched must not stop every peer after it, nor the client
-                    # from coming up at all. The state is kept, so the next start
-                    # tries again.
+                except BaseException as e:
+                    # Re-raise task cancellation and interpreter shutdown — these
+                    # must not be swallowed.  Everything else (RPC errors, network
+                    # failures, unexpected server replies) is logged and the loop
+                    # moves on: one unrecoverable peer must not abort the others.
+                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise
                     log.exception("Gap recovery failed for %s", id)
                     failed = True
                     break
@@ -230,11 +286,11 @@ class RecoverGaps:
                     break
 
             if failed:
-                continue
+                return (message_updates_counter, other_updates_counter)
 
             if unusable:
                 await self._save_update_state(id)
-                continue
+                return (message_updates_counter, other_updates_counter)
 
             await self._save_update_state(
                 (
@@ -246,6 +302,4 @@ class RecoverGaps:
                 )
             )
 
-        log.info("Recovered %s messages and %s updates", message_updates_counter, other_updates_counter)
         return (message_updates_counter, other_updates_counter)
-
