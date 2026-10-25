@@ -140,6 +140,8 @@ class Dispatcher:
         self._modify_lock = asyncio.Lock()
 
         self.updates_queue = asyncio.Queue(maxsize=256)
+        self._stop_event = asyncio.Event()
+        self._stopping = False
         self.groups = OrderedDict()
 
         self.listeners = getattr(client, "listeners", None)
@@ -354,12 +356,49 @@ class Dispatcher:
         self.update_parsers = {key: value for key_tuple, value in self.update_parsers.items() for key in key_tuple}
 
     async def enqueue_update(self, update, users, chats) -> bool:
-        if self.client.no_updates:
+        if self.client.no_updates or self._stopping:
             return False
-        await self.updates_queue.put((update, users, chats))
-        return True
+
+        packet = (update, users, chats)
+        try:
+            self.updates_queue.put_nowait(packet)
+            return True
+        except asyncio.QueueFull:
+            pass
+
+        put_task = asyncio.create_task(self.updates_queue.put(packet))
+        stop_task = asyncio.create_task(self._stop_event.wait())
+
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (put_task, stop_task),
+                    timeout=self.ENQUEUE_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if put_task.done():
+                    await put_task
+                    return True
+
+                if stop_task.done():
+                    return False
+
+                if not done:
+                    log.warning(
+                        "Update queue is full (%s pending); waiting for workers",
+                        self.updates_queue.qsize(),
+                    )
+        finally:
+            for task in (put_task, stop_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(put_task, stop_task, return_exceptions=True)
 
     async def start(self):
+        self._stopping = False
+        self._stop_event.clear()
+
         if callable(self.client.start_handler):
             try:
                 await self.client.start_handler(self.client)
@@ -385,6 +424,9 @@ class Dispatcher:
         ]
 
     async def stop(self, clear_handlers: bool = True):
+        self._stopping = True
+        self._stop_event.set()
+
         if callable(self.client.stop_handler):
             try:
                 await self.client.stop_handler(self.client)
