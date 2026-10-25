@@ -18,8 +18,6 @@
 
 import asyncio
 import logging
-import sys
-import weakref
 from typing import Iterable, Optional, Tuple, Union
 
 import pyrogram
@@ -79,35 +77,26 @@ class RecoverGaps:
         ]
 
         async def _run_one(local_state) -> Tuple[int, int]:
-            id, local_pts, local_qts, local_date, local_seq = local_state
-            # _peer_recovery_locks is a WeakValueDictionary: entries are
-            # collected automatically once no coroutine holds the lock, so
-            # the dict never grows unbounded for accounts with many channels.
+            id = local_state[0]
             peer_lock = self._peer_recovery_locks.setdefault(id, asyncio.Lock())
-            return await self._recover_peer(
-                id, local_pts, local_qts, local_date, local_seq, peer_lock
-            )
+            return await self._recover_peer(id, peer_lock)
 
-        # On Python 3.11+ use TaskGroup so all peers are recovered concurrently
-        # and a single peer failure does not silently abort the rest.
-        # On 3.10 fall back to asyncio.gather with return_exceptions=True so
-        # behaviour is equivalent: failures are logged, not propagated.
-        if sys.version_info >= (3, 11):
-            results: list[Tuple[int, int] | BaseException] = []
-            async with asyncio.TaskGroup() as tg:
-                tasks = [tg.create_task(_run_one(s)) for s in eligible]
-            results = [t.result() for t in tasks]
-        else:
-            raw_results = await asyncio.gather(
-                *(_run_one(s) for s in eligible),
-                return_exceptions=True,
-            )
-            results = []
-            for r in raw_results:
-                if isinstance(r, BaseException):
-                    log.exception("Gap recovery task raised unexpectedly: %r", r)
-                else:
-                    results.append(r)
+        raw_results = await asyncio.gather(
+            *(_run_one(state) for state in eligible),
+            return_exceptions=True,
+        )
+        results = []
+        for result in raw_results:
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
+                log.error(
+                    "Gap recovery task failed: %s",
+                    result,
+                    exc_info=(type(result), result, result.__traceback__)
+                )
+                continue
+            results.append(result)
 
         for msgs, upds in results:
             message_updates_counter += msgs
@@ -119,17 +108,18 @@ class RecoverGaps:
     async def _recover_peer(
         self: "pyrogram.Client",
         id: int,
-        local_pts,
-        local_qts,
-        local_date,
-        local_seq,
         lock: asyncio.Lock,
     ) -> Tuple[int, int]:
-        """Run the GetDifference loop for a single peer under its per-peer lock."""
         message_updates_counter = 0
         other_updates_counter = 0
 
         async with lock:
+            states = await self.storage.update_state()
+            local_state = next((state for state in states or () if state[0] == id), None)
+            if local_state is None:
+                return (0, 0)
+
+            _, local_pts, local_qts, local_date, local_seq = local_state
             stale_attempts = 0
             unusable = False
             failed = False
@@ -156,6 +146,7 @@ class RecoverGaps:
                             qts=local_qts or 0
                         )
                     )
+                    stale_attempts = 0
                 except (ChannelPrivate, ChannelInvalid, PeerIdInvalid):
                     unusable = True
                     break
@@ -172,13 +163,7 @@ class RecoverGaps:
 
                     await asyncio.sleep(stale_attempts)
                     continue
-                except BaseException as e:
-                    # Re-raise task cancellation and interpreter shutdown — these
-                    # must not be swallowed.  Everything else (RPC errors, network
-                    # failures, unexpected server replies) is logged and the loop
-                    # moves on: one unrecoverable peer must not abort the others.
-                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                        raise
+                except Exception:
                     log.exception("Gap recovery failed for %s", id)
                     failed = True
                     break
@@ -231,14 +216,10 @@ class RecoverGaps:
                     pts_from_dialog = getattr(diff.dialog, "pts", None)
 
                     if pts_from_dialog is None:
-                        # Dialog.pts is flags.0?int in the TL schema — it is absent for
-                        # certain channel types (e.g. broadcast channels without a pts
-                        # counter).  Without a pts anchor we cannot resume, so drop the
-                        # stored state and stop trying to recover this peer.
                         log.warning(
-                            "ChannelDifferenceTooLong for %s returned a dialog with no "
-                            "pts field; dropping stored state to avoid a stuck loop.",
-                            id
+                            "Channel %s returned no pts in ChannelDifferenceTooLong; "
+                            "skipping recovery",
+                            id,
                         )
                         unusable = True
                         break
@@ -261,8 +242,7 @@ class RecoverGaps:
                 chats = {i.id: i for i in diff.chats}
 
                 for message in diff.new_messages:
-                    message_updates_counter += 1
-                    await self.dispatcher.enqueue_update(
+                    queued = await self.dispatcher.enqueue_update(
                         raw.types.UpdateNewMessage(
                             message=message,
                             pts=local_pts,
@@ -271,16 +251,30 @@ class RecoverGaps:
                         users,
                         chats
                     )
+                    if not queued:
+                        log.warning("Update queue rejected a recovered message; keeping the old pts")
+                        return (message_updates_counter, other_updates_counter)
+                    message_updates_counter += 1
 
                 for update in diff.other_updates:
+                    queued = await self.dispatcher.enqueue_update(update, users, chats)
+                    if not queued:
+                        log.warning("Update queue rejected a recovered update; keeping the old pts")
+                        return (message_updates_counter, other_updates_counter)
                     other_updates_counter += 1
-                    await self.dispatcher.enqueue_update(update, users, chats)
 
                 if isinstance(diff, raw.types.updates.Difference):
                     break
 
                 if isinstance(diff, raw.types.updates.ChannelDifference) and diff.final:
                     break
+
+                if isinstance(diff, raw.types.updates.DifferenceSlice) or (
+                    isinstance(diff, raw.types.updates.ChannelDifference) and not diff.final
+                ):
+                    await self._save_update_state(
+                        (id, local_pts, local_qts, local_date, local_seq)
+                    )
 
                 if (local_pts, local_qts) == request:
                     break
