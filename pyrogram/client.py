@@ -633,6 +633,10 @@ class Client(Methods):
         self.last_update_time = datetime.now()
         self._last_update_monotonic = time.monotonic()
         self._state_marks = {}
+        self._state_loaded = set()
+        self._seq_mark = None
+        self._date_mark = None
+        self._updates_seq_lock = asyncio.Lock()
         self._recovering = set()
         # Per-peer asyncio.Lock so concurrent callers (public recover_gaps() and
         # internal _recover_too_long_state()) queue up rather than race on pts.
@@ -704,7 +708,7 @@ class Client(Methods):
                     await self.invoke(raw.functions.updates.GetState())
 
                     if not self.skip_updates:
-                        await self.recover_gaps()
+                        await self.recover_gaps(ids=0)
                 except Exception:
                     log.exception("Updates watchdog poll failed")
 
@@ -1129,9 +1133,47 @@ class Client(Methods):
 
         return is_min
 
+    async def _load_update_mark(self, state_id):
+        loaded = getattr(self, "_state_loaded", None)
+        if loaded is None:
+            self._state_loaded = loaded = set()
+        if state_id in loaded:
+            return
+
+        rows = await self.storage.update_state()
+        row = next((item for item in rows or () if item[0] == state_id), None)
+        known_pts, known_qts = self._state_marks.get(state_id, (None, None))
+
+        if row is not None:
+            pts, qts = row[1], row[2]
+            if pts is not None:
+                known_pts = pts if known_pts is None else max(known_pts, pts)
+            if qts is not None:
+                known_qts = qts if known_qts is None else max(known_qts, qts)
+            if state_id == 0:
+                seq = getattr(self, "_seq_mark", None)
+                date = getattr(self, "_date_mark", None)
+                if seq is None or (row[4] is not None and row[4] > seq):
+                    self._seq_mark = row[4]
+                if date is None or (row[3] is not None and row[3] > date):
+                    self._date_mark = row[3]
+
+        self._state_marks[state_id] = (known_pts, known_qts)
+        loaded.add(state_id)
+
+    def _peer_recovery_lock(self, state_id):
+        locks = getattr(self, "_peer_recovery_locks", None)
+        if locks is None:
+            self._peer_recovery_locks = locks = weakref.WeakValueDictionary()
+        return locks.setdefault(state_id, asyncio.Lock())
+
     async def _save_update_state(self, state):
         if isinstance(state, int):
             self._state_marks.pop(state, None)
+            getattr(self, "_state_loaded", set()).discard(state)
+            if state == 0:
+                self._seq_mark = None
+                self._date_mark = None
             await self.storage.update_state(state)
             return
 
@@ -1144,6 +1186,17 @@ class Client(Methods):
         if qts is not None and known_qts is not None and qts < known_qts:
             qts = None
 
+        date = state[3] if len(state) > 3 else None
+        seq = state[4] if len(state) > 4 else None
+        if state_id == 0:
+            known_seq = getattr(self, "_seq_mark", None)
+            known_date = getattr(self, "_date_mark", None)
+            if seq is not None and known_seq is not None and seq < known_seq:
+                seq = None
+                date = None
+            elif date is not None and known_date is not None and date < known_date:
+                date = None
+
         if pts is None and qts is None and (state[1] is not None or state[2] is not None):
             return
 
@@ -1151,101 +1204,282 @@ class Client(Methods):
             known_pts if pts is None else pts,
             known_qts if qts is None else qts,
         )
+        loaded = getattr(self, "_state_loaded", None)
+        if loaded is None:
+            self._state_loaded = loaded = set()
+        loaded.add(state_id)
 
-        await self.storage.update_state((state_id, pts, qts) + tuple(state[3:]))
+        if state_id == 0:
+            old_date = getattr(self, "_date_mark", None)
+            old_seq = getattr(self, "_seq_mark", None)
+            if date is not None:
+                self._date_mark = date if old_date is None else max(date, old_date)
+            if seq is not None:
+                self._seq_mark = seq if old_seq is None else max(seq, old_seq)
+
+        await self.storage.update_state((state_id, pts, qts, date, seq))
+
+    async def _enqueue_ordered_update(
+        self, update, users, chats, state_id=0, pts=None, pts_count=None, qts=None
+    ):
+        if pts is None and qts is None:
+            return await self.dispatcher.enqueue_update(update, users, chats)
+
+        keys = set()
+        if pts is not None:
+            keys.add(state_id)
+        if qts is not None:
+            keys.add(0)
+        keys = sorted(keys)
+
+        for attempt in range(2):
+            gaps = []
+            duplicate = False
+            async with contextlib.AsyncExitStack() as stack:
+                for key in keys:
+                    await stack.enter_async_context(self._peer_recovery_lock(key))
+                    await self._load_update_mark(key)
+
+                if pts is not None and pts_count is not None and pts_count >= 0:
+                    known_pts, known_qts = self._state_marks.get(state_id, (None, None))
+                    if known_pts is None:
+                        known_pts = pts - pts_count
+                        self._state_marks[state_id] = (known_pts, known_qts)
+                    if known_pts + pts_count > pts:
+                        duplicate = True
+                    elif known_pts + pts_count < pts:
+                        gaps.append(state_id)
+
+                if qts is not None:
+                    known_pts, known_qts = self._state_marks.get(0, (None, None))
+                    if known_qts is None:
+                        known_qts = qts - 1
+                        self._state_marks[0] = (known_pts, known_qts)
+                    if known_qts >= qts:
+                        duplicate = True
+                    elif known_qts + 1 < qts:
+                        gaps.append(0)
+
+                if duplicate and not gaps:
+                    return None
+
+                if not gaps:
+                    queued = await self.dispatcher.enqueue_update(update, users, chats)
+                    if not queued:
+                        return False
+
+                    if pts is not None and pts_count is not None and pts_count >= 0:
+                        known_pts, known_qts = self._state_marks.get(state_id, (None, None))
+                        self._state_marks[state_id] = (max(pts, known_pts or pts), known_qts)
+                    if qts is not None:
+                        known_pts, known_qts = self._state_marks.get(0, (None, None))
+                        self._state_marks[0] = (known_pts, max(qts, known_qts or qts))
+                    return True
+
+            for key in dict.fromkeys(gaps):
+                pts_mark, qts_mark = self._state_marks.get(key, (None, None))
+                if pts_mark is not None or qts_mark is not None:
+                    await self._save_update_state((key, pts_mark, qts_mark, None, None))
+                await self.recover_gaps(key)
+
+        for key in dict.fromkeys(gaps):
+            retry_pts = pts if key == state_id and key != 0 else None
+            self._recover_too_long(key, retry_pts)
+
+        log.warning("Update gap for state %s could not be recovered", state_id)
+        return False
+
+    async def _accept_update_sequence(self, updates):
+        seq = updates.seq
+        seq_start = getattr(updates, "seq_start", seq)
+        if seq_start == 0 or seq == 0:
+            return True
+
+        for _ in range(2):
+            async with self._peer_recovery_lock(0):
+                await self._load_update_mark(0)
+                known_seq = getattr(self, "_seq_mark", None)
+                if known_seq is None:
+                    self._seq_mark = seq_start - 1
+                    return True
+                if known_seq + 1 == seq_start:
+                    return True
+                if known_seq + 1 > seq_start:
+                    return False
+
+            pts, qts = self._state_marks.get(0, (None, None))
+            if pts is not None or qts is not None:
+                await self._save_update_state((0, pts, qts, None, None))
+            await self.recover_gaps(0)
+
+        log.warning("Updates sequence gap remains at seq_start=%s seq=%s", seq_start, seq)
+        return False
+
+    async def _handle_update_container(self, updates):
+        is_min = any((
+            await self.fetch_peers(updates.users),
+            await self.fetch_peers(updates.chats),
+        ))
+
+        users = {u.id: u for u in updates.users}
+        chats = {c.id: c for c in updates.chats}
+        pending_states = {}
+        other_updates = []
+        too_long = {}
+
+        for update in updates.updates:
+            channel_id = getattr(
+                getattr(getattr(update, "message", None), "peer_id", None),
+                "channel_id", None
+            ) or getattr(update, "channel_id", None)
+            key = utils.get_channel_id(channel_id) if channel_id else 0
+            pts = getattr(update, "pts", None)
+            pts_count = getattr(update, "pts_count", None)
+            qts = getattr(update, "qts", None)
+
+            if isinstance(update, raw.types.UpdateChannelTooLong):
+                too_long[utils.get_channel_id(update.channel_id)] = update.pts
+                other_updates.append(update)
+                continue
+
+            if isinstance(update, raw.types.UpdateNewChannelMessage) and is_min:
+                message = update.message
+                if not isinstance(message, raw.types.MessageEmpty):
+                    try:
+                        diff = await self.invoke(
+                            raw.functions.updates.GetChannelDifference(
+                                channel=await self.resolve_peer(utils.get_channel_id(channel_id)),
+                                filter=raw.types.ChannelMessagesFilter(
+                                    ranges=[raw.types.MessageRange(
+                                        min_id=message.id, max_id=message.id
+                                    )]
+                                ),
+                                pts=pts - pts_count,
+                                limit=1,
+                                force=False
+                            )
+                        )
+                    except (ChannelPrivate, PersistentTimestampOutdated, PersistentTimestampInvalid):
+                        pass
+                    except Exception:
+                        log.exception("Failed to resolve a min channel update")
+                    else:
+                        if not isinstance(diff, raw.types.updates.ChannelDifferenceEmpty):
+                            await self.fetch_peers(diff.users)
+                            await self.fetch_peers(diff.chats)
+                            users.update({u.id: u for u in diff.users})
+                            chats.update({c.id: c for c in diff.chats})
+
+            if pts is None and qts is None:
+                other_updates.append(update)
+                continue
+
+            queued = await self._enqueue_ordered_update(
+                update, users, chats, key, pts=pts, pts_count=pts_count, qts=qts
+            )
+            if queued is not True:
+                continue
+
+            if pts is not None and pts_count is not None and pts_count >= 0:
+                old_pts, old_qts = pending_states.get(key, (None, None))
+                pending_states[key] = (max(pts, old_pts) if old_pts is not None else pts, old_qts)
+            if qts is not None:
+                old_pts, old_qts = pending_states.get(0, (None, None))
+                pending_states[0] = (
+                    old_pts,
+                    max(qts, old_qts) if old_qts is not None else qts
+                )
+
+        common_pts, common_qts = pending_states.pop(0, (None, None))
+        seq_lock = getattr(self, "_updates_seq_lock", None)
+        if seq_lock is None:
+            self._updates_seq_lock = seq_lock = asyncio.Lock()
+
+        seq_ok = False
+        common_saved = False
+        async with seq_lock:
+            for _ in range(2):
+                if not await self._accept_update_sequence(updates):
+                    break
+
+                retry_seq = False
+                async with self._peer_recovery_lock(0):
+                    await self._load_update_mark(0)
+                    seq = updates.seq
+                    seq_start = getattr(updates, "seq_start", seq)
+                    known_seq = getattr(self, "_seq_mark", None)
+
+                    if seq_start == 0 or seq == 0:
+                        ready = True
+                    elif known_seq is None:
+                        self._seq_mark = seq_start - 1
+                        ready = True
+                    elif known_seq + 1 == seq_start:
+                        ready = True
+                    elif known_seq + 1 > seq_start:
+                        ready = False
+                    else:
+                        ready = False
+                        retry_seq = True
+
+                    if ready:
+                        seq_ok = True
+                        others_ok = True
+                        for update in other_updates:
+                            if not await self.dispatcher.enqueue_update(update, users, chats):
+                                others_ok = False
+                                break
+
+                        should_save = common_pts is not None or common_qts is not None or (
+                            others_ok and (updates.seq or other_updates)
+                        )
+                        if should_save:
+                            await self._save_update_state((
+                                0,
+                                common_pts,
+                                common_qts,
+                                updates.date if others_ok else None,
+                                updates.seq if others_ok and updates.seq else None,
+                            ))
+                        common_saved = True
+                        if not others_ok:
+                            seq_ok = False
+                        break
+
+                if not retry_seq:
+                    break
+
+        if not common_saved and (common_pts is not None or common_qts is not None):
+            async with self._peer_recovery_lock(0):
+                await self._save_update_state((0, common_pts, common_qts, None, None))
+
+        for state_id, (pts, qts) in pending_states.items():
+            known_pts, known_qts = self._state_marks.get(state_id, (None, None))
+            await self._save_update_state((
+                state_id,
+                known_pts if pts is not None else None,
+                known_qts if qts is not None else None,
+                None,
+                None,
+            ))
+
+        if seq_ok:
+            for key, pts in too_long.items():
+                self._recover_too_long(key, pts)
 
     async def handle_updates(self, updates):
-        # the datetime is what callers read; the watchdog measures a duration and
-        # a host clock that steps backwards must not stall it for the step
+        if getattr(self, "no_updates", False):
+            return
+
         self.last_update_time = datetime.now()
         self._last_update_monotonic = time.monotonic()
 
         if isinstance(updates, (raw.types.Updates, raw.types.UpdatesCombined)):
-            is_min = any((
-                await self.fetch_peers(updates.users),
-                await self.fetch_peers(updates.chats),
-            ))
-
-            users = {u.id: u for u in updates.users}
-            chats = {c.id: c for c in updates.chats}
-
-            # one write per peer per batch rather than per update: each costs a
-            # thread hand-off into aiosqlite, and only the highest pts matters
-            pending_states = {}
-            too_long = {}
-
-            for update in updates.updates:
-                channel_id = getattr(
-                    getattr(
-                        getattr(
-                            update, "message", None
-                        ), "peer_id", None
-                    ), "channel_id", None
-                ) or getattr(update, "channel_id", None)
-
-                pts = getattr(update, "pts", None)
-                pts_count = getattr(update, "pts_count", None)
-                qts = getattr(update, "qts", None)
-
-                if isinstance(update, raw.types.UpdateChannelTooLong):
-                    too_long[utils.get_channel_id(channel_id)] = pts
-                elif pts:
-                    key = utils.get_channel_id(channel_id) if channel_id else 0
-                    known = pending_states.get(key, (key, None, None, updates.date, updates.seq))
-
-                    if known[1] is None or pts > known[1]:
-                        pending_states[key] = (key, pts) + known[2:]
-
-                if qts:
-                    known = pending_states.get(0, (0, None, None, updates.date, updates.seq))
-
-                    if known[2] is None or qts > known[2]:
-                        pending_states[0] = known[:2] + (qts,) + known[3:]
-
-                if isinstance(update, raw.types.UpdateNewChannelMessage) and is_min:
-                    message = update.message
-
-                    if not isinstance(message, raw.types.MessageEmpty):
-                        try:
-                            diff = await self.invoke(
-                                raw.functions.updates.GetChannelDifference(
-                                    channel=await self.resolve_peer(utils.get_channel_id(channel_id)),
-                                    filter=raw.types.ChannelMessagesFilter(
-                                        ranges=[raw.types.MessageRange(
-                                            min_id=update.message.id,
-                                            max_id=update.message.id
-                                        )]
-                                    ),
-                                    pts=pts - pts_count,
-                                    limit=pts,
-                                    force=False
-                                )
-                            )
-                        except (ChannelPrivate, PersistentTimestampOutdated, PersistentTimestampInvalid):
-                            pass
-                        else:
-                            if not isinstance(diff, raw.types.updates.ChannelDifferenceEmpty):
-                                await self.fetch_peers(diff.users)
-                                await self.fetch_peers(diff.chats)
-                                users.update({u.id: u for u in diff.users})
-                                chats.update({c.id: c for c in diff.chats})
-
-                await self.dispatcher.enqueue_update(update, users, chats)
-
-            for state in pending_states.values():
-                await self._save_update_state(state)
-
-            for key, pts in too_long.items():
-                self._recover_too_long(key, pts)
+            await self._handle_update_container(updates)
         elif isinstance(updates, (raw.types.UpdateShortMessage, raw.types.UpdateShortChatMessage)):
-            lock = self._peer_recovery_locks.setdefault(0, asyncio.Lock())
+            lock = self._peer_recovery_lock(0)
             async with lock:
-                if 0 not in self._state_marks:
-                    states = await self.storage.update_state()
-                    state = next((row for row in states or () if row[0] == 0), None)
-                    if state is not None:
-                        self._state_marks[0] = (state[1], state[2])
-
+                await self._load_update_mark(0)
                 known_pts, known_qts = self._state_marks.get(0, (None, None))
                 if known_pts is not None and known_pts >= updates.pts:
                     return
@@ -1255,21 +1489,20 @@ class Client(Methods):
                     self._state_marks[0] = (pts, known_qts)
                 await self._handle_short_update(updates, pts)
         elif isinstance(updates, raw.types.UpdateShort):
-            queued = await self.dispatcher.enqueue_update(updates.update, {}, {})
-
-            qts = getattr(updates.update, "qts", None)
-
-            if queued and qts:
+            update = updates.update
+            qts = getattr(update, "qts", None)
+            queued = await self._enqueue_ordered_update(update, {}, {}, qts=qts)
+            if queued and qts is not None:
                 await self._save_update_state((0, None, qts, updates.date, None))
         elif isinstance(updates, raw.types.UpdatesTooLong):
             self._recover_too_long(0, None)
-
     async def _handle_short_update(self, update, pts):
         date = update.date
         qts = -1
 
         try:
             while True:
+                before = (pts, qts, date)
                 diff = await self.invoke(
                     raw.functions.updates.GetDifference(pts=pts, date=date, qts=qts)
                 )
@@ -1296,11 +1529,12 @@ class Client(Methods):
                 chats = {c.id: c for c in diff.chats}
 
                 for message in diff.new_messages:
-                    if not await self.dispatcher.enqueue_update(
+                    queued = await self.dispatcher.enqueue_update(
                         raw.types.UpdateNewMessage(message=message, pts=state.pts, pts_count=-1),
                         users,
                         chats,
-                    ):
+                    )
+                    if not queued:
                         log.warning("Update queue rejected a recovered message; keeping the old pts")
                         return
 
@@ -1308,11 +1542,16 @@ class Client(Methods):
                     if not await self.dispatcher.enqueue_update(item, users, chats):
                         log.warning("Update queue rejected a recovered update; keeping the old pts")
                         return
+                    if isinstance(item, raw.types.UpdateChannelTooLong):
+                        self._recover_too_long(utils.get_channel_id(item.channel_id), item.pts)
 
                 await self._save_update_state((0, state.pts, state.qts, state.date, state.seq))
                 if complete:
                     return
 
+                if (state.pts, state.qts, state.date) == before:
+                    log.warning("GetDifference returned a slice without advancing state")
+                    return
                 pts, qts, date = state.pts, state.qts, state.date
         except Exception as e:
             log.warning(
@@ -1333,18 +1572,29 @@ class Client(Methods):
         utils.run_in_background(self._recover_too_long_state(key, pts), self.loop)
 
     async def _recover_too_long_state(self, key, pts):
-        # recover_gaps() acquires the per-peer lock internally, so concurrent
-        # calls for the same peer — whether from _recover_too_long or from the
-        # public API — will queue up rather than issuing parallel GetDifference
-        # calls that race on the pts pointer.
         try:
-            if key in self._state_marks:
+            await self._load_update_mark(key)
+            known_pts, known_qts = self._state_marks.get(key, (None, None))
+            if known_pts is not None or known_qts is not None:
                 await self.recover_gaps(key)
-            elif key == 0:
-                state = await self.invoke(raw.functions.updates.GetState())
-                await self._save_update_state((0, state.pts, state.qts, state.date, state.seq))
-            elif pts is not None:
-                await self._save_update_state((key, pts, None, None, None))
+                return
+
+            should_recover = False
+            async with self._peer_recovery_lock(key):
+                await self._load_update_mark(key)
+                known_pts, known_qts = self._state_marks.get(key, (None, None))
+                if known_pts is not None or known_qts is not None:
+                    should_recover = True
+                elif key == 0:
+                    state = await self.invoke(raw.functions.updates.GetState())
+                    await self._save_update_state((
+                        0, state.pts, state.qts, state.date, state.seq
+                    ))
+                elif pts is not None:
+                    await self._save_update_state((key, pts, None, None, None))
+
+            if should_recover:
+                await self.recover_gaps(key)
         except Exception:
             log.exception("Recovery after too long update failed for %s", key)
         finally:
@@ -1352,6 +1602,9 @@ class Client(Methods):
 
     async def load_session(self):
         self._state_marks = {}
+        self._state_loaded = set()
+        self._seq_mark = None
+        self._date_mark = None
         await self.storage.open()
 
         session_empty = any([
