@@ -30,14 +30,17 @@ Category     Rate/s      Burst       Covers
 ``message``  20          30          sending, editing, forwarding text
 ``media``    5           10          anything carrying a photo, video, audio, file
 ``query``    30          50          ``Get*``, ``Search*``, ``Check*``
-``admin``    15          20          bans, promotions, pins, toggles, deletes
-``bulk``     3           5           update-difference fetches, pings
+``admin``    15          20          bans, promotions, permissions, pins, toggles
+``bulk``     3           5           message/history deletes, update-difference fetches, pings
 ``account``  10          15          account-level changes
 ``global``   30          40          everything, on top of its own category
 ===========  ==========  ==========  ==============================================
 
 A request is classified from the name of the raw function it wraps, so a new method lands in
 the right bucket without anything being registered by hand.
+
+After a ``FloodWait``, the affected category and global rates back off. Successful requests
+gradually bring them back to their configured rates.
 
 Tuning it
 ---------
