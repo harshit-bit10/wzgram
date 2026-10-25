@@ -378,10 +378,6 @@ class Dispatcher:
 
             if not self.client.skip_updates:
                 await self.client.recover_gaps(ids=0)
-                states = await self.client.storage.update_state()
-                peer_ids = [state[0] for state in states or () if state[0] != 0]
-                if peer_ids:
-                    await self.client.recover_gaps(ids=peer_ids)
 
     def prune_workers(self):
         self.handler_worker_tasks = [
@@ -569,11 +565,6 @@ class Dispatcher:
         while True:
             if relief and self.parked < len(self.relief_workers):
                 break
-
-            if self.client.rate_limiter is not None and not self.client.rate_limiter.is_closed:
-                congestion = self.client.rate_limiter.congestion()
-                if congestion > 0.8:
-                    await asyncio.sleep(min(0.5, congestion * 2))
 
             packet = await self.updates_queue.get()
 
