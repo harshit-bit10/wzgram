@@ -168,13 +168,6 @@ class Invoke:
         name = inner.QUALNAME if hasattr(inner, "QUALNAME") else type(inner).__name__
         short = name.split(".")[-1] if "." in name else name
 
-        if any(x in name for x in ("Send", "Upload", "Edit", "Forward", "Save")):
-            if any(x in name for x in ("Media", "Photo", "Video", "Audio", "Document", "Animation", "Voice", "Sticker", "Round")):
-                return RateLimiter.CATEGORY_MEDIA
-            return RateLimiter.CATEGORY_MESSAGE
-
-        # DeleteMessages / DeleteHistory are high-volume bulk ops, not admin actions.
-        # Only structural permission changes count as ADMIN.
         if any(x in name for x in ("Ban", "Kick", "Unban", "Promote", "EditAdmin", "EditBanned")):
             return RateLimiter.CATEGORY_ADMIN
 
@@ -182,6 +175,11 @@ class Invoke:
             if any(x in name for x in ("Messages", "History", "Scheduled", "Reactions")):
                 return RateLimiter.CATEGORY_BULK
             return RateLimiter.CATEGORY_ADMIN
+
+        if any(x in name for x in ("Send", "Upload", "Edit", "Forward", "Save")):
+            if any(x in name for x in ("Media", "Photo", "Video", "Audio", "Document", "Animation", "Voice", "Sticker", "Round")):
+                return RateLimiter.CATEGORY_MEDIA
+            return RateLimiter.CATEGORY_MESSAGE
 
         if any(x in name for x in ("GetDifference", "GetState", "Ping", "HttpWait")):
             return RateLimiter.CATEGORY_BULK
@@ -311,10 +309,11 @@ class Invoke:
             )
         except (FloodWait, FloodPremiumWait):
             if rl is not None and not rl.is_closed and category is not None:
-                b = rl._buckets.get(category)
-                if b is not None and hasattr(b, "on_flood"):
-                    b.on_flood()
+                rl.on_flood(category)
             raise
+        else:
+            if rl is not None and not rl.is_closed and category is not None:
+                rl.on_success(category)
 
         try:
             await self.fetch_peers(getattr(r, "users", []))
