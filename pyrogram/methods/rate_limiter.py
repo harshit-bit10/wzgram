@@ -146,15 +146,25 @@ class RateLimiter:
                 else:
                     resolved[cat] = cfg
 
-        self._buckets: dict[str, TokenBucket] = {}
-        self._global = TokenBucket(
-            rate=resolved.get("global", {}).get("rate", 30.0),
-            burst=resolved.get("global", {}).get("burst", 40.0),
+        global_cfg = resolved.get("global", {})
+        global_rate = global_cfg.get("rate", 30.0)
+        self._buckets: dict[str, AdaptiveBucket] = {}
+        self._global = AdaptiveBucket(
+            rate=global_rate,
+            ceiling=global_rate,
+            burst=global_cfg.get("burst", 40.0),
+            floor=min(1.0, global_rate),
         )
         for cat, cfg in resolved.items():
             if cat == "global":
                 continue
-            self._buckets[cat] = TokenBucket(rate=cfg.get("rate", 30.0), burst=cfg.get("burst", cfg.get("rate", 30.0)))
+            rate = cfg.get("rate", 30.0)
+            self._buckets[cat] = AdaptiveBucket(
+                rate=rate,
+                ceiling=rate,
+                burst=cfg.get("burst", rate),
+                floor=min(1.0, rate),
+            )
 
         self._closed = False
 
@@ -165,6 +175,18 @@ class RateLimiter:
         if bucket:
             await bucket.acquire(tokens)
         await self._global.acquire(tokens)
+
+    def on_flood(self, category: str):
+        bucket = self._buckets.get(category)
+        if bucket:
+            bucket.on_flood()
+        self._global.on_flood()
+
+    def on_success(self, category: str):
+        bucket = self._buckets.get(category)
+        if bucket:
+            bucket.on_success()
+        self._global.on_success()
 
     def acquire_nowait(self, category: str, tokens: float = 1.0) -> bool:
         if self._closed:
@@ -207,12 +229,16 @@ class RateLimiter:
     def update_limits(self, category: str, rate: float, burst: float):
         if category == "global":
             old = self._global
-            self._global = TokenBucket(rate=rate, burst=burst)
+            self._global = AdaptiveBucket(
+                rate=rate, ceiling=rate, burst=burst, floor=min(1.0, rate)
+            )
             self._global._tokens = min(old._tokens, burst)
             self._global._total_taken = old._total_taken
         else:
             old = self._buckets.get(category)
-            self._buckets[category] = TokenBucket(rate=rate, burst=burst)
+            self._buckets[category] = AdaptiveBucket(
+                rate=rate, ceiling=rate, burst=burst, floor=min(1.0, rate)
+            )
             if old:
                 self._buckets[category]._tokens = min(old._tokens, burst)
                 self._buckets[category]._total_taken = old._total_taken
