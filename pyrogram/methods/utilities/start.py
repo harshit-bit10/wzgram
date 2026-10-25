@@ -68,16 +68,22 @@ class Start:
                 self.takeout_id = (await self.invoke(raw.functions.account.InitTakeoutSession())).id
                 log.info("Takeout session %s initiated", self.takeout_id)
 
-            await self.invoke(raw.functions.updates.GetState())
+            async with self._peer_recovery_lock(0):
+                state = await self.invoke(raw.functions.updates.GetState())
+                saved_states = await self.storage.update_state()
+                if not any(row[0] == 0 for row in saved_states or ()):
+                    await self._save_update_state((
+                        0, state.pts, state.qts, state.date, state.seq
+                    ))
 
             # inside the try: a failure in either used to leave a connected client
             # the caller had no way to clean up
             self.me = await self.get_me()
             await self.initialize()
-        except (Exception, KeyboardInterrupt):
+        except BaseException:
             try:
                 await self.disconnect()
-            except Exception:
+            except BaseException:
                 log.exception("Error disconnecting after a failed start")
 
             raise
